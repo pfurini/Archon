@@ -92,6 +92,12 @@ export {
   type CopilotProviderDefaults,
 } from './community/copilot';
 export {
+  ClaudeTerminalProvider,
+  parseClaudeTerminalConfig,
+  registerClaudeTerminalProvider,
+  type ClaudeTerminalProviderDefaults,
+} from './community/claude-terminal';
+export {
   resolveCopilotBinaryPath,
   fileExists as copilotFileExists,
 } from './community/copilot/binary-resolver';
