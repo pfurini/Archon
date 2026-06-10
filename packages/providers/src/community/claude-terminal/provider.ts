@@ -52,7 +52,12 @@ import {
 } from './launch';
 import { TerminalcpClient, bracketedPaste, type TerminalDriver } from './terminalcp';
 import { TranscriptReader } from './transcript';
-import { detectScreenActivity, isTranscriptTurnComplete, isTurnComplete } from './turn-detector';
+import {
+  detectScreenActivity,
+  isTranscriptTurnComplete,
+  isTurnComplete,
+  stripAnsi,
+} from './turn-detector';
 
 let cachedLog: ReturnType<typeof createLogger> | undefined;
 function getLog(): ReturnType<typeof createLogger> {
@@ -66,6 +71,18 @@ const BOOT_TIMEOUT_MS = 30_000;
 const INPUT_READY_POLL_MS = 500;
 const TRANSCRIPT_WAIT_POLL_MS = 400;
 const SCREEN_TAIL_LINES = 80;
+const SCREEN_ERROR_TAIL_LINES = 40;
+
+/** Render the freshest screen read for a failure message: ANSI-stripped,
+ *  right-trimmed, capped to the last N lines. The screen is operator chrome —
+ *  never data — but at failure time it is the only witness of WHY the TUI
+ *  stalled (API retry spinner, usage-limit notice, login prompt, …); without
+ *  it a timeout is undiagnosable post-hoc because `finally` tears the PTY down. */
+function describeScreen(screen: string): string {
+  const text = stripAnsi(screen).replace(/\s+$/u, '');
+  if (!text) return '(screen empty)';
+  return text.split('\n').slice(-SCREEN_ERROR_TAIL_LINES).join('\n');
+}
 
 /** Resolve a json_schema output format from request options or node config. */
 function resolveOutputSchema(
@@ -239,13 +256,15 @@ export class ClaudeTerminalProvider implements IAgentProvider {
           if (isTranscriptTurnComplete(drained.summary)) break;
           throw new Error(
             `claude-terminal session ${sessionId} exited before completing the turn ` +
-              '(the TUI process died — e.g. a crash or a Claude session/usage limit)'
+              '(the TUI process died — e.g. a crash or a Claude session/usage limit). ' +
+              `Last screen:\n${describeScreen(screen)}`
           );
         }
 
         if (this.now() > deadline) {
           throw new Error(
-            `claude-terminal turn exceeded ${turnTimeoutMs}ms without completing (session ${sessionId})`
+            `claude-terminal turn exceeded ${turnTimeoutMs}ms without completing (session ${sessionId}). ` +
+              `Last screen:\n${describeScreen(screen)}`
           );
         }
         await this.sleep(pollIntervalMs);
@@ -285,9 +304,11 @@ export class ClaudeTerminalProvider implements IAgentProvider {
   ): Promise<void> {
     const deadline = this.now() + BOOT_TIMEOUT_MS;
     let trustAccepts = 0;
+    let lastScreen = '';
     while (this.now() < deadline) {
       throwIfAborted();
       const screen = await client.stdout(sessionName, SCREEN_TAIL_LINES);
+      lastScreen = screen;
       if (isTrustPrompt(screen) && trustAccepts < 3) {
         // Option 1 ("Yes, I trust this folder") is preselected — Enter accepts.
         await client.stdin(sessionName, ['::Enter']);
@@ -298,7 +319,10 @@ export class ClaudeTerminalProvider implements IAgentProvider {
       if (detectScreenActivity(screen).inputReady) return;
       await this.sleep(INPUT_READY_POLL_MS);
     }
-    throw new Error('claude-terminal: TUI did not become input-ready within boot timeout');
+    throw new Error(
+      'claude-terminal: TUI did not become input-ready within boot timeout. ' +
+        `Last screen:\n${describeScreen(lastScreen)}`
+    );
   }
 
   /** Poll for the session transcript file to appear (new session, after the

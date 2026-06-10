@@ -47,6 +47,8 @@ const TOOL_ONLY_LINE =
   }) + '\n';
 
 const IDLE_SCREEN = '────────\n❯ \n────────\n  Model: Sonnet 4.6 │ Time: 5s';
+// A mid-generation screen with ANSI chrome — what a stalled TUI typically shows.
+const WORKING_SCREEN = '\x1b[2mold log line\x1b[0m\n✻ Cultivating… (123s · thinking)';
 const TRUST_SCREEN =
   'Is this a project you created or one you trust?\n❯ 1. Yes, I trust this folder';
 
@@ -256,5 +258,67 @@ describe('ClaudeTerminalProvider', () => {
     await expect(drain(provider.sendQuery('hi', '/w'))).rejects.toThrow(
       /exceeded .* without completing/
     );
+  });
+
+  it('timeout error carries the last screen tail, ANSI-stripped', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'archon-ct-'));
+    const tpath = join(dir, 'sess.jsonl');
+    // Boot sees the idle screen; every poll after that sees the working screen.
+    const driver = new FakeDriver([IDLE_SCREEN, WORKING_SCREEN], () =>
+      writeFileSync(tpath, TOOL_ONLY_LINE)
+    );
+    const times = new Array(10).fill(0);
+    let n = 0;
+    const provider = new ClaudeTerminalProvider({
+      createClient: () => driver,
+      resolveBinary: async () => '/c',
+      findTranscript: async () => (existsSync(tpath) ? tpath : null),
+      sleep: async () => {},
+      now: () => (n < times.length ? times[n++] : 10_000_000),
+    });
+    const err = (await drain(provider.sendQuery('hi', '/w')).catch((e: unknown) => e)) as Error;
+    expect(err).toBeInstanceOf(Error);
+    expect(err.message).toMatch(/exceeded .* without completing/);
+    expect(err.message).toContain('Last screen:');
+    expect(err.message).toContain('Cultivating… (123s');
+    expect(err.message).not.toContain('\x1b[');
+  });
+
+  it('dead-session error carries the last screen tail', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'archon-ct-'));
+    const tpath = join(dir, 'sess.jsonl');
+    const driver = new FakeDriver(
+      [IDLE_SCREEN, WORKING_SCREEN],
+      () => writeFileSync(tpath, TOOL_ONLY_LINE),
+      () => false
+    );
+    const provider = new ClaudeTerminalProvider({
+      createClient: () => driver,
+      resolveBinary: async () => '/c',
+      findTranscript: async () => (existsSync(tpath) ? tpath : null),
+      sleep: async () => {},
+    });
+    const err = (await drain(provider.sendQuery('hi', '/w')).catch((e: unknown) => e)) as Error;
+    expect(err.message).toMatch(/exited before completing the turn/);
+    expect(err.message).toContain('Last screen:');
+    expect(err.message).toContain('Cultivating… (123s');
+  });
+
+  it('boot-timeout error carries the last screen tail', async () => {
+    const driver = new FakeDriver([WORKING_SCREEN]); // never becomes input-ready
+    const times = [0, 1]; // deadline calc, one loop iteration; then far past
+    let n = 0;
+    const provider = new ClaudeTerminalProvider({
+      createClient: () => driver,
+      resolveBinary: async () => '/c',
+      findTranscript: async () => null,
+      sleep: async () => {},
+      now: () => (n < times.length ? times[n++] : 10_000_000),
+    });
+    const err = (await drain(provider.sendQuery('hi', '/w')).catch((e: unknown) => e)) as Error;
+    expect(err.message).toMatch(/did not become input-ready/);
+    expect(err.message).toContain('Last screen:');
+    expect(err.message).toContain('Cultivating… (123s');
+    expect(driver.calls.some(c => c.m === 'stop')).toBe(true);
   });
 });

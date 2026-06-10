@@ -47,7 +47,7 @@ export function isTranscriptTurnComplete(summary: TurnSummary): boolean {
 // colors). Strip them before matching. Built via fromCharCode(27) so the ESC
 // (0x1b) never appears as a control character in a regex literal (no-control-regex).
 const ANSI = new RegExp(`${String.fromCharCode(27)}\\[[0-9;?]*[A-Za-z]`, 'g');
-function stripAnsi(s: string): string {
+export function stripAnsi(s: string): string {
   return s.replace(ANSI, '');
 }
 
