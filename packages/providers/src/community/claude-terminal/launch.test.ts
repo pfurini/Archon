@@ -80,7 +80,7 @@ describe('shellQuote / buildLaunchCommand', () => {
       API_KEY: 's3cret',
     });
     expect(cmd).toBe(
-      "cd '/work dir' && env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT API_KEY='s3cret' '/bin/claude' '--session-id' 'u1'"
+      "cd '/work dir' && env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_EFFORT API_KEY='s3cret' '/bin/claude' '--session-id' 'u1'"
     );
   });
 });

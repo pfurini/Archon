@@ -66,12 +66,17 @@ export function shellQuote(value: string): string {
 }
 
 /** Env vars stripped from the spawned TUI so it isn't treated as a nested Claude
- *  Code session (which alters behavior / can trip nested-session guards). */
-const STRIPPED_ENV = ['CLAUDECODE', 'CLAUDE_CODE_ENTRYPOINT'];
+ *  Code session (which alters behavior / can trip nested-session guards).
+ *  CLAUDE_EFFORT is a per-session value an outer Claude Code session exports to
+ *  its subshells; left in place it can reach the spawned TUI through the
+ *  long-lived terminalcp daemon's env and silently change reasoning effort
+ *  between runs. Stripping it keeps effort governed by the user's settings
+ *  (`effortLevel`), deterministic across launch contexts. */
+const STRIPPED_ENV = ['CLAUDECODE', 'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_EFFORT'];
 
 /**
  * Build the command string handed to `terminalcp start` (run via its `bash -c`):
- * `cd <cwd> && env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT [K=V …] <binary> <args…>`.
+ * `cd <cwd> && env -u <STRIPPED_ENV…> [K=V …] <binary> <args…>`.
  * `envOverrides` carries codebase-scoped env vars (requestOptions.env).
  */
 export function buildLaunchCommand(
