@@ -11,6 +11,8 @@ describe('parseClaudeTerminalConfig', () => {
         terminalcpCommand: 'npx terminalcp',
         turnTimeoutMs: 5000,
         pollIntervalMs: 200,
+        stallTimeoutMs: 240_000,
+        maxStallRecoveries: 2,
       })
     ).toEqual({
       model: 'sonnet',
@@ -18,7 +20,21 @@ describe('parseClaudeTerminalConfig', () => {
       terminalcpCommand: 'npx terminalcp',
       turnTimeoutMs: 5000,
       pollIntervalMs: 200,
+      stallTimeoutMs: 240_000,
+      maxStallRecoveries: 2,
     });
+  });
+
+  it('keeps maxStallRecoveries: 0 (explicit watchdog disable)', () => {
+    expect(parseClaudeTerminalConfig({ maxStallRecoveries: 0 })).toEqual({
+      maxStallRecoveries: 0,
+    });
+  });
+
+  it('drops invalid stall-watchdog fields', () => {
+    expect(parseClaudeTerminalConfig({ stallTimeoutMs: 0 })).toEqual({});
+    expect(parseClaudeTerminalConfig({ maxStallRecoveries: -1 })).toEqual({});
+    expect(parseClaudeTerminalConfig({ maxStallRecoveries: 1.5 })).toEqual({});
   });
 
   it('drops wrong-typed and unknown fields without throwing', () => {

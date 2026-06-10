@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from 'bun:test';
-import { mkdtempSync, writeFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, appendFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -46,6 +46,35 @@ const TOOL_ONLY_LINE =
     },
   }) + '\n';
 
+// A turn stalled BETWEEN requests: the tool round-trip completed (tool_result
+// delivered, openToolUses back to 0) but the next assistant message never came —
+// the exact transcript signature of a wedged API turn.
+const STALLED_AFTER_TOOL_LINES =
+  [
+    JSON.stringify({
+      type: 'assistant',
+      message: {
+        content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: {} }],
+        stop_reason: 'tool_use',
+        usage: { input_tokens: 5, output_tokens: 5 },
+      },
+    }),
+    JSON.stringify({
+      type: 'user',
+      message: { content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }] },
+    }),
+  ].join('\n') + '\n';
+
+const COMPLETION_LINE =
+  JSON.stringify({
+    type: 'assistant',
+    message: {
+      content: [{ type: 'text', text: 'Recovered' }],
+      stop_reason: 'end_turn',
+      usage: { input_tokens: 5, output_tokens: 3 },
+    },
+  }) + '\n';
+
 const IDLE_SCREEN = '────────\n❯ \n────────\n  Model: Sonnet 4.6 │ Time: 5s';
 // A mid-generation screen with ANSI chrome — what a stalled TUI typically shows.
 const WORKING_SCREEN = '\x1b[2mold log line\x1b[0m\n✻ Cultivating… (123s · thinking)';
@@ -62,8 +91,8 @@ class FakeDriver implements TerminalDriver {
     private readonly onPaste?: () => void,
     private readonly alive: () => boolean | undefined = () => true
   ) {}
-  async start(): Promise<string> {
-    this.calls.push({ m: 'start' });
+  async start(_name: string, command: string): Promise<string> {
+    this.calls.push({ m: 'start', segments: [command] });
     return 'session';
   }
   async stdin(_name: string, segments: string[]): Promise<void> {
@@ -320,5 +349,84 @@ describe('ClaudeTerminalProvider', () => {
     expect(err.message).toContain('Last screen:');
     expect(err.message).toContain('Cultivating… (123s');
     expect(driver.calls.some(c => c.m === 'stop')).toBe(true);
+  });
+
+  it('stall watchdog: replaces a wedged session (--resume + "continue") and the turn completes', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'archon-ct-'));
+    const tpath = join(dir, 'sess.jsonl');
+    let pastes = 0;
+    const driver = new FakeDriver([IDLE_SCREEN], () => {
+      pastes++;
+      if (pastes === 1) writeFileSync(tpath, STALLED_AFTER_TOOL_LINES);
+      else appendFileSync(tpath, COMPLETION_LINE); // the "continue" nudge gets answered
+    });
+    let t = 0;
+    const provider = new ClaudeTerminalProvider({
+      createClient: () => driver,
+      resolveBinary: async () => '/c',
+      findTranscript: async () => (existsSync(tpath) ? tpath : null),
+      sleep: async () => {
+        t += 100_000; // each poll advances 100s of fake time
+      },
+      now: () => t,
+    });
+
+    const chunks = await drain(provider.sendQuery('do it', '/w'));
+    expect(chunks.at(-1)?.type).toBe('result');
+
+    const starts = driver.calls.filter(c => c.m === 'start');
+    expect(starts.length).toBe(2); // original spawn + watchdog respawn
+    expect(starts[0].segments?.[0]).toContain('--session-id');
+    expect(starts[1].segments?.[0]).toContain('--resume');
+    const pasted = driver.stdins().filter(s => s?.[0]?.startsWith('\x1b[200~'));
+    expect(pasted.length).toBe(2);
+    expect(pasted[1]?.[0]).toContain('continue');
+  });
+
+  it('stall watchdog: never fires while a tool call is in flight', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'archon-ct-'));
+    const tpath = join(dir, 'sess.jsonl');
+    // Open tool_use with no tool_result: silence is expected (a long-running
+    // tool writes nothing) — the watchdog must stay quiet up to the deadline.
+    const driver = new FakeDriver([IDLE_SCREEN], () => writeFileSync(tpath, TOOL_ONLY_LINE));
+    let t = 0;
+    const provider = new ClaudeTerminalProvider({
+      createClient: () => driver,
+      resolveBinary: async () => '/c',
+      findTranscript: async () => (existsSync(tpath) ? tpath : null),
+      sleep: async () => {
+        t += 100_000;
+      },
+      now: () => t,
+    });
+
+    const err = (await drain(provider.sendQuery('hi', '/w')).catch((e: unknown) => e)) as Error;
+    expect(err.message).toMatch(/exceeded .* without completing/);
+    expect(driver.calls.filter(c => c.m === 'start').length).toBe(1); // no respawn
+  });
+
+  it('stall watchdog: recoveries are capped — the turn deadline stays the backstop', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'archon-ct-'));
+    const tpath = join(dir, 'sess.jsonl');
+    let pastes = 0;
+    const driver = new FakeDriver([IDLE_SCREEN], () => {
+      pastes++;
+      if (pastes === 1) writeFileSync(tpath, STALLED_AFTER_TOOL_LINES);
+      // later pastes: the model stays silent — still wedged after recovery
+    });
+    let t = 0;
+    const provider = new ClaudeTerminalProvider({
+      createClient: () => driver,
+      resolveBinary: async () => '/c',
+      findTranscript: async () => (existsSync(tpath) ? tpath : null),
+      sleep: async () => {
+        t += 100_000;
+      },
+      now: () => t,
+    });
+
+    const err = (await drain(provider.sendQuery('hi', '/w')).catch((e: unknown) => e)) as Error;
+    expect(err.message).toMatch(/exceeded .* without completing/);
+    expect(driver.calls.filter(c => c.m === 'start').length).toBe(2); // exactly one recovery
   });
 });

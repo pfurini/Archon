@@ -67,6 +67,11 @@ function getLog(): ReturnType<typeof createLogger> {
 
 const DEFAULT_TURN_TIMEOUT_MS = 10 * 60_000;
 const DEFAULT_POLL_INTERVAL_MS = 800;
+const DEFAULT_STALL_TIMEOUT_MS = 4 * 60_000;
+const DEFAULT_MAX_STALL_RECOVERIES = 1;
+/** Injected after a stall-recovery respawn — a plain user nudge; the resumed
+ *  conversation already holds the original prompt and all prior work. */
+const STALL_CONTINUE_PROMPT = 'continue';
 const BOOT_TIMEOUT_MS = 30_000;
 const INPUT_READY_POLL_MS = 500;
 const TRANSCRIPT_WAIT_POLL_MS = 400;
@@ -180,9 +185,19 @@ export class ClaudeTerminalProvider implements IAgentProvider {
       mcpConfigPaths: nodeConfig?.mcp ? [resolveMcpPath(nodeConfig.mcp, cwd)] : undefined,
     };
     const command = buildLaunchCommand(binary, buildClaudeArgs(spec), cwd, requestOptions?.env);
+    // Same launch but resuming this session — used by the stall watchdog to
+    // replace a wedged TUI process without losing the conversation.
+    const resumeCommand = buildLaunchCommand(
+      binary,
+      buildClaudeArgs({ ...spec, resume: true }),
+      cwd,
+      requestOptions?.env
+    );
 
     const turnTimeoutMs = config.turnTimeoutMs ?? DEFAULT_TURN_TIMEOUT_MS;
     const pollIntervalMs = config.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+    const stallTimeoutMs = config.stallTimeoutMs ?? DEFAULT_STALL_TIMEOUT_MS;
+    const maxStallRecoveries = config.maxStallRecoveries ?? DEFAULT_MAX_STALL_RECOVERIES;
 
     const abortSignal = requestOptions?.abortSignal;
     const throwIfAborted = (): void => {
@@ -224,6 +239,8 @@ export class ClaudeTerminalProvider implements IAgentProvider {
       const reader = new TranscriptReader(transcriptPath, startOffset);
       let assistantText = '';
       let deadPolls = 0;
+      let lastProgressAt = this.now();
+      let stallRecoveries = 0;
 
       for (;;) {
         throwIfAborted();
@@ -231,6 +248,9 @@ export class ClaudeTerminalProvider implements IAgentProvider {
         for (const chunk of chunks) {
           if (chunk.type === 'assistant') assistantText += chunk.content;
           yield chunk;
+        }
+        if (chunks.length > 0) {
+          lastProgressAt = this.now();
         }
         const screen = await client.stdout(sessionName, SCREEN_TAIL_LINES);
         if (isTurnComplete(summary, screen)) break;
@@ -267,6 +287,44 @@ export class ClaudeTerminalProvider implements IAgentProvider {
               `Last screen:\n${describeScreen(screen)}`
           );
         }
+
+        // Stall watchdog: no transcript progress for stallTimeoutMs while NO
+        // tool call is in flight. openToolUses > 0 means silence is expected
+        // (a long-running tool writes nothing between tool_use and tool_result);
+        // with the tools balanced, prolonged silence is the signature of a turn
+        // wedged in/before its next API request (observed: 9 min of dead air
+        // after a delivered tool_result). Recovery is process-level, not
+        // keystroke-level: kill the TUI (a stuck in-flight request dies with
+        // it, writing nothing), respawn with --resume (appends to the same
+        // transcript — the reader keeps its offset, and the resume-bootstrap
+        // synthetic turn is already filtered), and nudge with a plain
+        // "continue". The turn deadline above stays the hard backstop —
+        // recoveries spend it, never extend it.
+        if (
+          stallRecoveries < maxStallRecoveries &&
+          summary.openToolUses === 0 &&
+          this.now() - lastProgressAt > stallTimeoutMs
+        ) {
+          stallRecoveries++;
+          log.warn(
+            {
+              sessionId,
+              stallRecoveries,
+              stalledForMs: this.now() - lastProgressAt,
+              screen: describeScreen(screen),
+            },
+            'claude_terminal.stall_recovery'
+          );
+          await client.stop(sessionName);
+          await client.start(sessionName, resumeCommand);
+          await this.ensureInputReady(client, sessionName, throwIfAborted);
+          await client.stdin(sessionName, ['::C-u']);
+          await client.stdin(sessionName, [bracketedPaste(STALL_CONTINUE_PROMPT), '::Enter']);
+          lastProgressAt = this.now();
+          deadPolls = 0;
+          continue;
+        }
+
         await this.sleep(pollIntervalMs);
       }
 

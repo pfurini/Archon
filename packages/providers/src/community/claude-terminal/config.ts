@@ -41,5 +41,23 @@ export function parseClaudeTerminalConfig(
     result.pollIntervalMs = raw.pollIntervalMs;
   }
 
+  if (
+    typeof raw.stallTimeoutMs === 'number' &&
+    Number.isFinite(raw.stallTimeoutMs) &&
+    raw.stallTimeoutMs > 0
+  ) {
+    result.stallTimeoutMs = raw.stallTimeoutMs;
+  }
+
+  // 0 is meaningful (disables the stall watchdog), so >= 0 — unlike the
+  // duration fields above, which are nonsensical at 0.
+  if (
+    typeof raw.maxStallRecoveries === 'number' &&
+    Number.isInteger(raw.maxStallRecoveries) &&
+    raw.maxStallRecoveries >= 0
+  ) {
+    result.maxStallRecoveries = raw.maxStallRecoveries;
+  }
+
   return result;
 }

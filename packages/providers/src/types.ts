@@ -180,6 +180,15 @@ export interface ClaudeTerminalProviderDefaults {
   turnTimeoutMs?: number;
   /** Transcript/screen poll interval while awaiting a turn (ms). */
   pollIntervalMs?: number;
+  /**
+   * Stall watchdog: max ms without transcript progress (while no tool call is
+   * in flight) before the provider replaces the TUI process (`--resume` + a
+   * "continue" nudge). Must exceed the longest legitimate silent gap between
+   * transcript writes (auto-compaction, one long thinking block). Default 4 min.
+   */
+  stallTimeoutMs?: number;
+  /** Max stall recoveries per turn (0 disables the watchdog). Default 1. */
+  maxStallRecoveries?: number;
 }
 
 /** Generic per-provider defaults bag used by config surfaces and UI. */
