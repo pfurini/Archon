@@ -26,37 +26,39 @@ const MAX_TOOL_OUTPUT = 10_000;
  *  Claude Code's on-disk shapes, not Archon types. Optional fields cover every
  *  block variant we care about without `any`. */
 interface RawBlock {
-  type: string;
+  content?: unknown;
+  id?: string;
+  input?: Record<string, unknown>;
+  name?: string;
   text?: string;
   thinking?: string;
-  id?: string;
-  name?: string;
-  input?: Record<string, unknown>;
   tool_use_id?: string;
-  content?: unknown;
+  type: string;
 }
 
 interface RawUsage {
+  cache_creation_input_tokens?: number;
+  cache_read_input_tokens?: number;
   input_tokens?: number;
   output_tokens?: number;
   total_tokens?: number;
-  cache_creation_input_tokens?: number;
-  cache_read_input_tokens?: number;
 }
 
 interface RawMessage {
-  role?: string;
   content?: RawBlock[] | string;
+  id?: string;
   model?: string;
+  role?: string;
   stop_reason?: string | null;
   usage?: RawUsage;
-  id?: string;
 }
 
 /** A parsed transcript line (only the fields we read). */
 export interface ParsedTranscriptLine {
-  type?: string;
   message?: RawMessage;
+  /** Discriminator for `type: 'system'` lines (e.g. 'turn_duration', 'stop_hook_summary'). */
+  subtype?: string;
+  type?: string;
 }
 
 /**
@@ -79,10 +81,14 @@ export function isSyntheticAssistant(line: ParsedTranscriptLine): boolean {
 /** Parse one JSONL line. Returns null for blank/non-JSON lines (never throws). */
 export function parseTranscriptLine(raw: string): ParsedTranscriptLine | null {
   const trimmed = raw.trim();
-  if (!trimmed) return null;
+  if (!trimmed) {
+    return null;
+  }
   try {
     const value: unknown = JSON.parse(trimmed);
-    if (value && typeof value === 'object') return value as ParsedTranscriptLine;
+    if (value && typeof value === 'object') {
+      return value as ParsedTranscriptLine;
+    }
     return null;
   } catch {
     return null;
@@ -126,7 +132,9 @@ export function mapTranscriptLine(
 ): MessageChunk[] {
   const chunks: MessageChunk[] = [];
   const content = line.message?.content;
-  if (!Array.isArray(content)) return chunks; // string user prompts / chrome lines → nothing
+  if (!Array.isArray(content)) {
+    return chunks; // string user prompts / chrome lines → nothing
+  }
 
   if (line.type === 'assistant') {
     for (const block of content) {
@@ -139,7 +147,9 @@ export function mapTranscriptLine(
       ) {
         chunks.push({ type: 'thinking', content: block.thinking });
       } else if (block.type === 'tool_use' && typeof block.name === 'string') {
-        if (typeof block.id === 'string') toolNamesById.set(block.id, block.name);
+        if (typeof block.id === 'string') {
+          toolNamesById.set(block.id, block.name);
+        }
         chunks.push({
           type: 'tool',
           toolName: block.name,
@@ -174,12 +184,22 @@ export interface TurnSummary {
   lastAssistantStopReason?: string;
   /** Model of the most recent assistant message. */
   model?: string;
-  /** Aggregated token usage for the turn (output summed; input = latest). */
-  usage?: TokenUsage;
   /** tool_use blocks seen minus tool_result blocks seen — >0 means a tool is mid-flight. */
   openToolUses: number;
   /** True once any assistant line has been observed this turn. */
   sawAssistant: boolean;
+  /**
+   * True once Claude Code has written a `turn_duration` system line for this turn —
+   * the core, screen-independent turn-boundary marker (emitted after the final
+   * assistant message and any Stop hooks). When set, the transcript is
+   * authoritative and the screen `working` heuristic must NOT hold completion
+   * back: post-turn chrome (Stop-hook output, plugin panels) can keep the screen
+   * matching "still generating" indefinitely and falsely stall the poll loop to
+   * `turnTimeoutMs` even though the turn is done. See turn-detector.ts.
+   */
+  sawTurnEnd: boolean;
+  /** Aggregated token usage for the turn (output summed; input = latest). */
+  usage?: TokenUsage;
 }
 
 /** Read `path` from `offset` to EOF. Returns '' if the file is missing or hasn't grown. */
@@ -192,7 +212,9 @@ async function readFrom(path: string, offset: number): Promise<string> {
   }
   try {
     const { size } = await handle.stat();
-    if (size <= offset) return '';
+    if (size <= offset) {
+      return '';
+    }
     const buf = Buffer.alloc(size - offset);
     await handle.read(buf, 0, size - offset, offset);
     return buf.toString('utf8');
@@ -214,7 +236,11 @@ async function readFrom(path: string, offset: number): Promise<string> {
 export class TranscriptReader {
   private offset: number;
   private readonly toolNamesById = new Map<string, string>();
-  private summary: TurnSummary = { openToolUses: 0, sawAssistant: false };
+  private summary: TurnSummary = {
+    openToolUses: 0,
+    sawAssistant: false,
+    sawTurnEnd: false,
+  };
 
   constructor(
     private readonly path: string,
@@ -237,7 +263,9 @@ export class TranscriptReader {
   async pull(): Promise<{ chunks: MessageChunk[]; summary: TurnSummary }> {
     const data = await readFrom(this.path, this.offset);
     const lastNl = data.lastIndexOf('\n');
-    if (lastNl === -1) return { chunks: [], summary: this.turnSummary };
+    if (lastNl === -1) {
+      return { chunks: [], summary: this.turnSummary };
+    }
 
     const complete = data.slice(0, lastNl);
     this.offset += Buffer.byteLength(complete, 'utf8') + 1; // +1 for the consumed '\n'
@@ -245,10 +273,14 @@ export class TranscriptReader {
     const chunks: MessageChunk[] = [];
     for (const rawLine of complete.split('\n')) {
       const parsed = parseTranscriptLine(rawLine);
-      if (!parsed) continue;
+      if (!parsed) {
+        continue;
+      }
       // Drop the resume-bootstrap synthetic turn before it can drive either
       // chunk emission or turn-completion (see isSyntheticAssistant).
-      if (isSyntheticAssistant(parsed)) continue;
+      if (isSyntheticAssistant(parsed)) {
+        continue;
+      }
       this.updateSummary(parsed);
       chunks.push(...mapTranscriptLine(parsed, this.toolNamesById));
     }
@@ -259,28 +291,46 @@ export class TranscriptReader {
     const content = line.message?.content;
     if (line.type === 'assistant') {
       this.summary.sawAssistant = true;
-      if (line.message?.stop_reason)
+      if (line.message?.stop_reason) {
         this.summary.lastAssistantStopReason = line.message.stop_reason;
-      if (line.message?.model) this.summary.model = line.message.model;
+      }
+      if (line.message?.model) {
+        this.summary.model = line.message.model;
+      }
       this.accumulateUsage(line.message?.usage);
       if (Array.isArray(content)) {
-        for (const block of content) if (block.type === 'tool_use') this.summary.openToolUses++;
+        for (const block of content) {
+          if (block.type === 'tool_use') {
+            this.summary.openToolUses++;
+          }
+        }
       }
     } else if (line.type === 'user' && Array.isArray(content)) {
       for (const block of content) {
-        if (block.type === 'tool_result' && this.summary.openToolUses > 0)
+        if (block.type === 'tool_result' && this.summary.openToolUses > 0) {
           this.summary.openToolUses--;
+        }
       }
+    } else if (line.type === 'system' && line.subtype === 'turn_duration') {
+      // Claude Code emits a `turn_duration` system line once per turn, at the
+      // boundary (after the final assistant message and any Stop hooks). It is
+      // the authoritative, screen-independent completion marker — see the
+      // `sawTurnEnd` doc on TurnSummary and isTurnComplete in turn-detector.ts.
+      this.summary.sawTurnEnd = true;
     }
   }
 
   private accumulateUsage(usage?: RawUsage): void {
-    if (!usage) return;
+    if (!usage) {
+      return;
+    }
     const prev = this.summary.usage;
     const input = typeof usage.input_tokens === 'number' ? usage.input_tokens : prev?.input;
     const addedOutput = typeof usage.output_tokens === 'number' ? usage.output_tokens : 0;
     const output = (prev?.output ?? 0) + addedOutput;
-    if (input === undefined && output === 0 && !prev) return;
+    if (input === undefined && output === 0 && !prev) {
+      return;
+    }
     const next: TokenUsage = { input: input ?? 0, output };
     next.total = next.input + next.output;
     this.summary.usage = next;

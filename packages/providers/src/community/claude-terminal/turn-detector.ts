@@ -66,10 +66,10 @@ const WORKING = /esc to interrupt|(?:…|\.\.\.)\s*\(\s*\d+\s*s\b/i;
 const EMPTY_PROMPT = /^[│|\s]*❯\s*$/m;
 
 export interface ScreenActivity {
-  /** TUI is actively generating (interrupt hint or live spinner visible). */
-  working: boolean;
   /** An empty input prompt is visible and the TUI is not working — ready to type. */
   inputReady: boolean;
+  /** TUI is actively generating (interrupt hint or live spinner visible). */
+  working: boolean;
 }
 
 export function detectScreenActivity(screen: string): ScreenActivity {
@@ -82,7 +82,26 @@ export function detectScreenActivity(screen: string): ScreenActivity {
 /**
  * Combined turn-completion check. Transcript-authoritative; the screen only
  * holds completion back while the TUI is visibly still working.
+ *
+ * Once Claude Code has written the turn's `turn_duration` system line
+ * (`summary.sawTurnEnd`), the turn is definitively over — that core marker is
+ * emitted AFTER the final assistant message and any Stop hooks, so the screen
+ * can only be post-turn chrome at that point. We therefore bypass the screen
+ * `working` guard: otherwise post-turn output (Stop-hook prints, plugin panels)
+ * can keep the screen matching the WORKING heuristic indefinitely and stall the
+ * poll loop to `turnTimeoutMs` even though the turn completed in seconds.
+ *
+ * When `sawTurnEnd` is NOT set (older Claude Code, or the marker hasn't flushed
+ * yet), we keep the original behavior: the screen holds completion back while
+ * the TUI is visibly still working, covering the case where the transcript
+ * flushed `end_turn` a poll before the screen settled.
  */
 export function isTurnComplete(summary: TurnSummary, screen: string): boolean {
-  return isTranscriptTurnComplete(summary) && !detectScreenActivity(screen).working;
+  if (!isTranscriptTurnComplete(summary)) {
+    return false;
+  }
+  if (summary.sawTurnEnd) {
+    return true;
+  }
+  return !detectScreenActivity(screen).working;
 }

@@ -1,15 +1,14 @@
-import { describe, it, expect, afterEach } from 'bun:test';
-import { mkdtempSync, writeFileSync, appendFileSync, rmSync } from 'node:fs';
+import { afterEach, describe, expect, it } from 'bun:test';
+import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-
+import type { MessageChunk } from '../../types';
 import {
-  parseTranscriptLine,
-  mapTranscriptLine,
   isSyntheticAssistant,
+  mapTranscriptLine,
+  parseTranscriptLine,
   TranscriptReader,
 } from './transcript';
-import type { MessageChunk } from '../../types';
 
 // ── Fixtures (shapes captured from real Claude Code 2.1.166 transcripts) ──────
 const assistantText = JSON.stringify({
@@ -28,7 +27,12 @@ const assistantThinkTool = JSON.stringify({
     role: 'assistant',
     content: [
       { type: 'thinking', thinking: 'let me think' },
-      { type: 'tool_use', id: 'toolu_1', name: 'Bash', input: { command: 'echo hi' } },
+      {
+        type: 'tool_use',
+        id: 'toolu_1',
+        name: 'Bash',
+        input: { command: 'echo hi' },
+      },
     ],
     stop_reason: 'tool_use',
     usage: { input_tokens: 120, output_tokens: 20 },
@@ -48,7 +52,10 @@ const userPrompt = JSON.stringify({
 // Resume-bootstrap synthetic pair Claude Code writes when `claude --resume` boots.
 const syntheticUser = JSON.stringify({
   type: 'user',
-  message: { role: 'user', content: [{ type: 'text', text: 'Continue from where you left off.' }] },
+  message: {
+    role: 'user',
+    content: [{ type: 'text', text: 'Continue from where you left off.' }],
+  },
 });
 const syntheticAssistant = JSON.stringify({
   type: 'assistant',
@@ -58,6 +65,13 @@ const syntheticAssistant = JSON.stringify({
     model: '<synthetic>',
     stop_reason: 'stop_sequence',
   },
+});
+// Core turn-boundary marker Claude Code writes once per turn, after the final
+// assistant message and any Stop hooks. `sawTurnEnd` keys on this.
+const turnDuration = JSON.stringify({
+  type: 'system',
+  subtype: 'turn_duration',
+  durationMs: 95_323,
 });
 
 describe('parseTranscriptLine', () => {
@@ -83,7 +97,12 @@ describe('mapTranscriptLine', () => {
     const chunks = mapTranscriptLine(parseTranscriptLine(assistantThinkTool)!, m);
     expect(chunks).toEqual([
       { type: 'thinking', content: 'let me think' },
-      { type: 'tool', toolName: 'Bash', toolInput: { command: 'echo hi' }, toolCallId: 'toolu_1' },
+      {
+        type: 'tool',
+        toolName: 'Bash',
+        toolInput: { command: 'echo hi' },
+        toolCallId: 'toolu_1',
+      },
     ]);
     expect(m.get('toolu_1')).toBe('Bash');
   });
@@ -92,7 +111,12 @@ describe('mapTranscriptLine', () => {
     const m = new Map<string, string>([['toolu_1', 'Bash']]);
     const chunks = mapTranscriptLine(parseTranscriptLine(userToolResult)!, m);
     expect(chunks).toEqual([
-      { type: 'tool_result', toolName: 'Bash', toolOutput: 'hi\n', toolCallId: 'toolu_1' },
+      {
+        type: 'tool_result',
+        toolName: 'Bash',
+        toolOutput: 'hi\n',
+        toolCallId: 'toolu_1',
+      },
     ]);
   });
 
@@ -113,7 +137,11 @@ describe('mapTranscriptLine', () => {
         type: 'user',
         message: {
           content: [
-            { type: 'tool_result', tool_use_id: 'x', content: [{ type: 'text', text: 'out' }] },
+            {
+              type: 'tool_result',
+              tool_use_id: 'x',
+              content: [{ type: 'text', text: 'out' }],
+            },
           ],
         },
       })
@@ -136,7 +164,9 @@ describe('isSyntheticAssistant', () => {
 describe('TranscriptReader', () => {
   let dir: string;
   afterEach(() => {
-    if (dir) rmSync(dir, { recursive: true, force: true });
+    if (dir) {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
   function tmpFile(contents: string): string {
     dir = mkdtempSync(join(tmpdir(), 'archon-transcript-'));
@@ -201,5 +231,18 @@ describe('TranscriptReader', () => {
     expect(answer.chunks).toEqual([{ type: 'assistant', content: 'Hello there' }]);
     expect(answer.summary.sawAssistant).toBe(true);
     expect(answer.summary.lastAssistantStopReason).toBe('end_turn');
+  });
+
+  it('sets sawTurnEnd when a turn_duration system line is read (and false before)', async () => {
+    const p = tmpFile(assistantText + '\n');
+    const reader = new TranscriptReader(p);
+    const before = await reader.pull();
+    expect(before.summary.sawTurnEnd).toBe(false); // end_turn alone is not the boundary marker
+
+    appendFileSync(p, turnDuration + '\n');
+    const after = await reader.pull();
+    expect(after.chunks).toEqual([]); // a system line streams no chunks
+    expect(after.summary.sawTurnEnd).toBe(true);
+    expect(after.summary.lastAssistantStopReason).toBe('end_turn'); // unchanged
   });
 });

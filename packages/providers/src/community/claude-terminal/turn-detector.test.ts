@@ -1,10 +1,9 @@
-import { describe, it, expect } from 'bun:test';
-
-import { isTranscriptTurnComplete, detectScreenActivity, isTurnComplete } from './turn-detector';
+import { describe, expect, it } from 'bun:test';
 import type { TurnSummary } from './transcript';
+import { detectScreenActivity, isTranscriptTurnComplete, isTurnComplete } from './turn-detector';
 
 function summary(over: Partial<TurnSummary>): TurnSummary {
-  return { openToolUses: 0, sawAssistant: true, ...over };
+  return { openToolUses: 0, sawAssistant: true, sawTurnEnd: false, ...over };
 }
 
 // Idle screen (settled): past-tense "Cooked for", empty ❯ box, no interrupt hint.
@@ -75,10 +74,16 @@ describe('isTranscriptTurnComplete', () => {
 
 describe('detectScreenActivity', () => {
   it('idle screen → not working, input ready', () => {
-    expect(detectScreenActivity(IDLE_SCREEN)).toEqual({ working: false, inputReady: true });
+    expect(detectScreenActivity(IDLE_SCREEN)).toEqual({
+      working: false,
+      inputReady: true,
+    });
   });
   it('working screen → working, not input ready', () => {
-    expect(detectScreenActivity(WORKING_SCREEN)).toEqual({ working: true, inputReady: false });
+    expect(detectScreenActivity(WORKING_SCREEN)).toEqual({
+      working: true,
+      inputReady: false,
+    });
   });
   it('trust dialog → not input ready (no empty prompt box)', () => {
     const a = detectScreenActivity(TRUST_SCREEN);
@@ -106,5 +111,38 @@ describe('isTurnComplete (combined)', () => {
     expect(isTurnComplete(summary({ lastAssistantStopReason: 'tool_use' }), IDLE_SCREEN)).toBe(
       false
     );
+  });
+
+  // Regression: the review-scope false-timeout (#claude-terminal). A turn that
+  // finished in seconds (end_turn + turn_duration written) stalled to
+  // turnTimeoutMs because Stop-hook output kept the screen matching WORKING.
+  it('complete on turn_duration marker even if the screen still looks working', () => {
+    expect(
+      isTurnComplete(
+        summary({ lastAssistantStopReason: 'end_turn', sawTurnEnd: true }),
+        WORKING_SCREEN
+      )
+    ).toBe(true);
+  });
+
+  it('turn_duration marker does NOT override a non-terminal transcript', () => {
+    // sawTurnEnd must never complete a turn whose transcript is not itself
+    // terminal — the transcript gate stays authoritative.
+    expect(
+      isTurnComplete(
+        summary({ lastAssistantStopReason: 'tool_use', sawTurnEnd: true }),
+        IDLE_SCREEN
+      )
+    ).toBe(false);
+    expect(
+      isTurnComplete(
+        summary({
+          lastAssistantStopReason: 'end_turn',
+          openToolUses: 1,
+          sawTurnEnd: true,
+        }),
+        IDLE_SCREEN
+      )
+    ).toBe(false);
   });
 });
