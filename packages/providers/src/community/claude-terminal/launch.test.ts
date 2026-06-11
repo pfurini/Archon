@@ -80,8 +80,20 @@ describe('shellQuote / buildLaunchCommand', () => {
       API_KEY: 's3cret',
     });
     expect(cmd).toBe(
-      "cd '/work dir' && env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_EFFORT API_KEY='s3cret' '/bin/claude' '--session-id' 'u1'"
+      "cd '/work dir' && env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_EFFORT " +
+        "CLAUDE_CODE_DISABLE_ADVISOR_TOOL='1' API_KEY='s3cret' '/bin/claude' '--session-id' 'u1'"
     );
+  });
+
+  it('disables the advisor by default; an explicit override wins', () => {
+    const plain = buildLaunchCommand('/bin/claude', [], '/w');
+    expect(plain).toContain("CLAUDE_CODE_DISABLE_ADVISOR_TOOL='1'");
+
+    const optIn = buildLaunchCommand('/bin/claude', [], '/w', {
+      CLAUDE_CODE_DISABLE_ADVISOR_TOOL: '0',
+    });
+    expect(optIn).toContain("CLAUDE_CODE_DISABLE_ADVISOR_TOOL='0'");
+    expect(optIn).not.toContain("CLAUDE_CODE_DISABLE_ADVISOR_TOOL='1'");
   });
 });
 

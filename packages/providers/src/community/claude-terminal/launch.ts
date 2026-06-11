@@ -74,10 +74,22 @@ export function shellQuote(value: string): string {
  *  (`effortLevel`), deterministic across launch contexts. */
 const STRIPPED_ENV = ['CLAUDECODE', 'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_EFFORT'];
 
+/** Env vars FORCED onto the spawned TUI (rendered before `envOverrides`, so an
+ *  explicit override can still opt back in).
+ *  CLAUDE_CODE_DISABLE_ADVISOR_TOOL: the advisor is an interactive-harness
+ *  feature — at its checkpoints it forwards the whole conversation to a
+ *  reviewer model out-of-band, rendering only on the screen and writing
+ *  NOTHING to the transcript, for minutes at a time. In an unattended worker
+ *  that is pure turn-budget burn (observed: two implement-node timeouts at
+ *  exactly the advisor checkpoints), and a workflow's own review nodes cover
+ *  the same ground. */
+const FORCED_ENV: Record<string, string> = { CLAUDE_CODE_DISABLE_ADVISOR_TOOL: '1' };
+
 /**
  * Build the command string handed to `terminalcp start` (run via its `bash -c`):
- * `cd <cwd> && env -u <STRIPPED_ENV…> [K=V …] <binary> <args…>`.
- * `envOverrides` carries codebase-scoped env vars (requestOptions.env).
+ * `cd <cwd> && env -u <STRIPPED_ENV…> <FORCED_ENV…> [K=V …] <binary> <args…>`.
+ * `envOverrides` carries codebase-scoped env vars (requestOptions.env) and is
+ * rendered after FORCED_ENV, so a same-key override wins.
  */
 export function buildLaunchCommand(
   binary: string,
@@ -86,7 +98,7 @@ export function buildLaunchCommand(
   envOverrides?: Record<string, string>
 ): string {
   const unset = STRIPPED_ENV.map(k => `-u ${k}`).join(' ');
-  const sets = Object.entries(envOverrides ?? {})
+  const sets = Object.entries({ ...FORCED_ENV, ...envOverrides })
     .map(([k, v]) => `${k}=${shellQuote(v)}`)
     .join(' ');
   const envPrefix = `env ${unset}${sets ? ` ${sets}` : ''}`;
