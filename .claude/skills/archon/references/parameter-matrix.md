@@ -16,7 +16,7 @@ There are seven node types. Exactly one of `command`, `prompt`, `bash`, `script`
 | `trigger_rule`                               | yes     | yes     | yes     | yes     | yes                          | yes            | yes     |
 | `idle_timeout`                               | yes     | yes     | ignored (use `timeout`) | ignored (use `timeout`) | yes (per-iter) | yes | yes |
 | `timeout` (total, not idle)                  | —       | —       | yes     | yes     | —                            | —              | —       |
-| `model` / `provider`                         | yes     | yes     | ignored | ignored | **ignored at runtime**       | ignored        | ignored |
+| `model` / `provider`                         | yes     | yes     | ignored | ignored | **yes** (resolved + forwarded per iteration) | ignored | ignored |
 | `context: fresh` \| `shared`                 | yes     | yes     | ignored | ignored | ignored (use `loop.fresh_context`) | ignored  | ignored |
 | `output_format`                              | yes     | yes     | ignored | ignored | ignored                      | ignored        | ignored |
 | `allowed_tools` / `denied_tools`             | yes     | yes     | ignored | ignored | ignored                      | ignored        | ignored |
@@ -36,7 +36,7 @@ There are seven node types. Exactly one of `command`, `prompt`, `bash`, `script`
 - **ignored** — field is accepted by the parser but has no effect at runtime. Loader emits a warning (`<node-type>_node_ai_fields_ignored`).
 - **hard error** — workflow fails to load. Only `retry` on a loop node does this.
 
-Most AI features work on `command` and `prompt` nodes. Loop nodes are thin controllers — the AI fields inside `loop.prompt` are what actually run. `bash` and `script` nodes silently ignore AI fields. `approval` and `cancel` nodes don't invoke AI at all.
+Most AI features work on `command` and `prompt` nodes. Loop nodes are thin controllers — the AI fields inside `loop.prompt` are what actually run — **except `model` and `provider`, which the executor resolves at the loop-node level and forwards to every iteration's AI call.** `bash` and `script` nodes silently ignore AI fields. `approval` and `cancel` nodes don't invoke AI at all.
 
 ## Parameter Selection by Intent
 
@@ -77,7 +77,7 @@ Organized by what you're trying to do, not by field name. Useful when you know t
 
 Things that don't fail parsing but don't do what you'd expect:
 
-1. **`model` / `provider` on a loop node** → silently ignored. Logged as `loop_node_ai_fields_ignored`. The loop is a controller; set model at workflow level or inside the loop prompt body.
+1. **`model` / `provider` on a loop node** → **NOT a silent failure (common misconception).** They ARE honored: the executor resolves them (tier-keyword aliases included) and forwards the spec to every iteration. They are deliberately excluded from `LOOP_NODE_AI_FIELDS`, so they do **not** trigger a `loop_node_ai_fields_ignored` warning. Use a per-node loop `model:` to run iterations on a different tier than the workflow default. (The loop's *other* AI fields — `hooks`/`mcp`/`skills`/`output_format`/tool restrictions — are still ignored; see #2.)
 2. **`hooks` / `mcp` / `skills` / `output_format` / `allowed_tools` / `denied_tools` on a loop, bash, script, approval, or cancel node** → silently ignored.
 3. **`context: fresh` on a loop** → ignored. Use `loop.fresh_context: true` instead.
 4. **`output_format` on a bash or script node** → schema is accepted but bash/script output is whatever stdout says; no JSON coercion.
