@@ -4,6 +4,11 @@
     "medium": { "model": "sonnet" },
     "large": { "model": "opus" }
   },
+  "claude-terminal": {
+    "small": { "model": "haiku" },
+    "medium": { "model": "sonnet" },
+    "large": { "model": "opus" }
+  },
   "codex": {
     "small": { "model": "gpt-5.5", "effort": "minimal" },
     "medium": { "model": "gpt-5.5", "effort": "medium" },
