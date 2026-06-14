@@ -2,12 +2,12 @@
   "claude": {
     "small": { "model": "haiku" },
     "medium": { "model": "sonnet" },
-    "large": { "model": "opus" }
+    "large": { "model": "claude-opus-4-6[1m]" }
   },
   "claude-terminal": {
     "small": { "model": "haiku" },
     "medium": { "model": "sonnet" },
-    "large": { "model": "opus" }
+    "large": { "model": "claude-opus-4-6[1m]" }
   },
   "codex": {
     "small": { "model": "gpt-5.5", "effort": "minimal" },

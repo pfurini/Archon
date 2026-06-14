@@ -904,8 +904,12 @@ tiers:
       const safe = toSafeConfig(config);
       // Configured tier round-trips.
       expect(safe.tiers?.large).toEqual({ provider: 'codex', model: 'gpt-5.5' });
-      // tierDefaults = built-in presets for the default provider (claude → opus@large).
-      expect(safe.tierDefaults?.large).toEqual({ provider: 'claude', model: 'opus' });
+      // tierDefaults = built-in presets for the default provider
+      // (claude → claude-opus-4-6[1m]@large, the 1M-context Opus 4.6).
+      expect(safe.tierDefaults?.large).toEqual({
+        provider: 'claude',
+        model: 'claude-opus-4-6[1m]',
+      });
       expect(safe.tierDefaults?.small).toEqual({ provider: 'claude', model: 'haiku' });
     });
   });
