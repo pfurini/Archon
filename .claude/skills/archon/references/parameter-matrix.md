@@ -25,7 +25,8 @@ There are seven node types. Exactly one of `command`, `prompt`, `bash`, `script`
 | `skills`                                     | yes     | yes     | ignored | ignored | ignored                      | ignored        | ignored |
 | `agents`                                     | yes     | yes     | ignored | ignored | ignored                      | ignored        | ignored |
 | `retry`                                      | yes     | yes     | yes     | yes     | **hard error**               | yes (`on_reject`) | yes  |
-| `effort` / `thinking` / `fallbackModel` / `betas` / `sandbox` / `maxBudgetUsd` / `systemPrompt` | yes | yes | ignored | ignored | ignored | ignored | ignored |
+| `effort` (portable; provider-mapped — see Providers table) | yes | yes | ignored | ignored | ignored | ignored | ignored |
+| `thinking` / `fallbackModel` / `betas` / `sandbox` / `maxBudgetUsd` / `systemPrompt` (Claude SDK) | yes | yes | ignored | ignored | ignored | ignored | ignored |
 | `bash` / `script` / `runtime` / `deps`       | —       | —       | `bash` required | `script` + `runtime` required | —            | —              | —       |
 | `loop` (nested config)                       | —       | —       | —       | —       | **required**                 | —              | —       |
 | `approval` (nested config)                   | —       | —       | —       | —       | —                            | **required**   | —       |
@@ -174,7 +175,8 @@ Use this matrix to find the right parameter. Use these references for the full e
 | `mcp` (per-node)                | yes           | global `~/.codex/config.toml` only      | not available                        |
 | `skills` (per-node)             | yes           | global `~/.agents/skills/` only         | not available                        |
 | Model naming                    | `haiku`, `sonnet`, `opus`, `opus[1m]`   | Codex model ID (e.g. `gpt-5.2`)         | `<vendor>/<model>` (e.g. `anthropic/claude-opus-4-5`, `openai/gpt-4o`, `groq/llama-3-70b`) |
-| `effort` / `thinking`           | yes           | use `modelReasoningEffort` for reasoning models | via `effort:` (maps to thinking level) |
+| `effort` (`low`/`medium`/`high`/`max`) | yes           | yes — node `effort:` → `modelReasoningEffort` (`max`→`xhigh`) | yes — `effort:` → thinking level (`max`→`xhigh`) |
+| `thinking`                      | yes           | n/a (use `effort` / `modelReasoningEffort`) | via `effort:` |
 | Session resume / `--resume`     | yes           | yes                                     | yes                                  |
 
 Mixing providers in one workflow: set workflow-level `provider: claude`, then override per-node with `provider: codex` or `provider: pi`. Cross-provider `$nodeId.output` substitution works as expected.

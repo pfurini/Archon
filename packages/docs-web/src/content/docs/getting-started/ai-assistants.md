@@ -706,7 +706,8 @@ Select it per workflow/node with `provider: claude-terminal`, or as the default 
 | System prompt override | ✅ | `systemPrompt:` → `--append-system-prompt` |
 | Codebase env vars (`envInjection`) | ✅ | injected into the spawned TUI's environment |
 | Cost limits (`maxBudgetUsd`) | ❌ | no budget cap in the interactive TUI |
-| Effort / thinking control | ❌ | not settable via a launch flag (thinking output is still captured) |
+| Effort control | ✅ | node `effort:` (`low`/`medium`/`high`/`max`) → the interactive `--effort` launch flag |
+| Thinking control | ❌ | not settable via a launch flag (thinking output is still captured) |
 | Fallback model | ❌ | no `--fallback-model` |
 | Sandbox | ❌ | not exposed by the TUI; Archon uses worktree isolation |
 | Hooks | ❌ | SDK in-process hook callbacks have no interactive-TUI equivalent |
