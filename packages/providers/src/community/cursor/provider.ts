@@ -137,9 +137,19 @@ export class CursorProvider implements IAgentProvider {
 
     const nodeConfig = requestOptions?.nodeConfig;
     const outputSchema = resolveOutputSchema(requestOptions, nodeConfig);
-    const effectivePrompt = outputSchema
-      ? augmentPromptForJsonSchema(prompt, outputSchema)
-      : prompt;
+    const basePrompt = outputSchema ? augmentPromptForJsonSchema(prompt, outputSchema) : prompt;
+    // Workaround for an upstream @cursor/sdk (1.0.18) bug: the built-in Shell
+    // tool returns EMPTY output / no exit code when a tool call omits
+    // `workingDirectory` — it does NOT fall back to the agent's cwd the way
+    // Read/Grep do. The model then retries forever and reports "Shell failed".
+    // Prepending this directive makes the model set `workingDirectory` reliably.
+    // (Prepended, not appended, so it never displaces the structured-output
+    // "final message = JSON" instruction.) Remove once the SDK defaults the
+    // shell working directory to the agent cwd.
+    const shellDirective =
+      `When using the Shell tool, ALWAYS set its \`workingDirectory\` argument to "${cwd}". ` +
+      'The Cursor Shell tool returns no output when it is omitted.';
+    const effectivePrompt = `${shellDirective}\n\n${basePrompt}`;
 
     // MCP passthrough: node `mcp:` file → Cursor's mcpServers map. Env vars in
     // the config are expanded from the per-request env first, then process env.

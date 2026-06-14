@@ -224,6 +224,15 @@ describe('CursorProvider.sendQuery', () => {
     expect(calls.created).toBe(false);
   });
 
+  it('prepends a Shell workingDirectory directive (upstream SDK workaround) referencing the cwd', async () => {
+    const { sdk, calls } = makeFakeSdk({ messages: [asst('ok')] });
+    const provider = new CursorProvider({ loadSdk: async () => sdk });
+    await collect(provider.sendQuery('do the thing', '/work/dir', undefined, BASE_OPTS));
+    expect(calls.sentPrompt).toContain('workingDirectory');
+    expect(calls.sentPrompt).toContain('/work/dir');
+    expect(calls.sentPrompt).toContain('do the thing'); // original prompt preserved
+  });
+
   it('extracts best-effort structured output from accumulated text', async () => {
     const { sdk } = makeFakeSdk({ messages: [asst('{"answer": '), asst('42}')] });
     const provider = new CursorProvider({ loadSdk: async () => sdk });
