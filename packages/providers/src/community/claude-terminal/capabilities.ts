@@ -16,8 +16,11 @@ import type { ProviderCapabilities } from '../../types';
  *   inline agent definitions, and in-process nativeTools. (With nativeTools
  *   false, the orchestrator auto-appends the bash run-management prompt for
  *   project-scoped chat — same path as Codex/OpenCode/Copilot.)
- * - effort/thinking are CAPTURED from the transcript but not CONTROLLABLE via a
- *   launch flag, so effortControl/thinkingControl are false.
+ * - effort IS controllable: the interactive CLI accepts `--effort <level>`
+ *   (Claude Code 2.1.166+), so effortControl is true. Archon's canonical effort
+ *   (low/medium/high/max) maps identity-wise onto the flag's vocabulary.
+ *   (CLAUDE_EFFORT the env var is output-only — see launch.ts STRIPPED_ENV.)
+ * - thinking has no interactive-launch equivalent, so thinkingControl is false.
  *
  * structuredOutput is best-effort (not SDK-enforced): the provider appends the
  * JSON schema to the prompt and extracts JSON from the final assistant
@@ -34,7 +37,7 @@ export const CLAUDE_TERMINAL_CAPABILITIES: ProviderCapabilities = {
   structuredOutput: 'best-effort', // prompt-augmented + JSON extraction (no SDK grammar enforcement)
   envInjection: true,
   costControl: false,
-  effortControl: false,
+  effortControl: true,
   thinkingControl: false,
   fallbackModel: false,
   sandbox: false,

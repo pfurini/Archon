@@ -24,6 +24,9 @@ export interface ClaudeLaunchSpec {
    *  Finding 7). */
   resume?: boolean;
   model?: string;
+  /** Provider-native effort level (already mapped from the canonical Archon
+   *  scale). Emitted as the interactive `--effort <level>` flag. */
+  effort?: string;
   /** MCP config file paths (from nodeConfig.mcp). */
   mcpConfigPaths?: string[];
   appendSystemPrompt?: string;
@@ -44,6 +47,9 @@ export function buildClaudeArgs(spec: ClaudeLaunchSpec): string[] {
     : ['--session-id', spec.sessionId];
 
   if (spec.model) args.push('--model', spec.model);
+  // `--effort <level>` sets the session's reasoning effort (Claude Code 2.1.166+).
+  // Validated by the CLI: an unknown value is warned-and-ignored, never fatal.
+  if (spec.effort) args.push('--effort', spec.effort);
 
   if (spec.dangerouslySkipPermissions === false) {
     if (spec.permissionMode) args.push('--permission-mode', spec.permissionMode);
@@ -67,11 +73,13 @@ export function shellQuote(value: string): string {
 
 /** Env vars stripped from the spawned TUI so it isn't treated as a nested Claude
  *  Code session (which alters behavior / can trip nested-session guards).
- *  CLAUDE_EFFORT is a per-session value an outer Claude Code session exports to
- *  its subshells; left in place it can reach the spawned TUI through the
- *  long-lived terminalcp daemon's env and silently change reasoning effort
- *  between runs. Stripping it keeps effort governed by the user's settings
- *  (`effortLevel`), deterministic across launch contexts. */
+ *  CLAUDE_EFFORT is OUTPUT-ONLY: Claude Code exports it (from its resolved
+ *  `effortLevel`) to hook commands, the Bash tool, and `${CLAUDE_EFFORT}` prompt
+ *  substitution — it is NOT read back as an effort input (verified against the
+ *  2.1.177 binary). We strip the inherited value purely as hygiene, so an outer
+ *  session's stale CLAUDE_EFFORT can't leak into the worker's hook/`${CLAUDE_EFFORT}`
+ *  substitution before Claude Code re-exports its own. The worker's reasoning
+ *  effort is governed by the `--effort` flag (see buildClaudeArgs), not by env. */
 const STRIPPED_ENV = ['CLAUDECODE', 'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_EFFORT'];
 
 /** Env vars FORCED onto the spawned TUI (rendered before `envOverrides`, so an

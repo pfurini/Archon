@@ -68,6 +68,24 @@ describe('buildClaudeArgs', () => {
     });
     expect(args).toEqual(['--session-id', 'u1', '--permission-mode', 'acceptEdits']);
   });
+
+  it('emits --effort after --model when effort is set', () => {
+    const args = buildClaudeArgs({ sessionId: 'u1', model: 'sonnet', effort: 'high' });
+    expect(args).toEqual([
+      '--session-id',
+      'u1',
+      '--model',
+      'sonnet',
+      '--effort',
+      'high',
+      '--dangerously-skip-permissions',
+    ]);
+  });
+
+  it('omits --effort when effort is unset', () => {
+    const args = buildClaudeArgs({ sessionId: 'u1' });
+    expect(args).not.toContain('--effort');
+  });
 });
 
 describe('shellQuote / buildLaunchCommand', () => {

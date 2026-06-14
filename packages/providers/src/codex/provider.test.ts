@@ -83,7 +83,7 @@ describe('CodexProvider', () => {
         structuredOutput: 'enforced',
         envInjection: true,
         costControl: false,
-        effortControl: false,
+        effortControl: true,
         thinkingControl: false,
         fallbackModel: false,
         sandbox: false,
@@ -116,6 +116,61 @@ describe('CodexProvider', () => {
         sessionId: 'new-thread-id',
         tokens: { input: 10, output: 5 },
       });
+    });
+
+    test('routes node effort to modelReasoningEffort, clamping max → xhigh', async () => {
+      mockRunStreamed.mockResolvedValue({
+        events: (async function* () {
+          yield { type: 'item.completed', item: { type: 'agent_message', text: 'ok' } };
+          yield { type: 'turn.completed', usage: defaultUsage };
+        })(),
+      });
+
+      for await (const _ of client.sendQuery('x', '/workspace', undefined, {
+        nodeConfig: { effort: 'max' },
+      })) {
+        // drain
+      }
+
+      const threadOptions = mockStartThread.mock.calls[0]?.[0] as { modelReasoningEffort?: string };
+      expect(threadOptions.modelReasoningEffort).toBe('xhigh');
+    });
+
+    test('node effort overrides the assistantConfig modelReasoningEffort default', async () => {
+      mockRunStreamed.mockResolvedValue({
+        events: (async function* () {
+          yield { type: 'item.completed', item: { type: 'agent_message', text: 'ok' } };
+          yield { type: 'turn.completed', usage: defaultUsage };
+        })(),
+      });
+
+      for await (const _ of client.sendQuery('x', '/workspace', undefined, {
+        assistantConfig: { modelReasoningEffort: 'low' },
+        nodeConfig: { effort: 'high' },
+      })) {
+        // drain
+      }
+
+      const threadOptions = mockStartThread.mock.calls[0]?.[0] as { modelReasoningEffort?: string };
+      expect(threadOptions.modelReasoningEffort).toBe('high');
+    });
+
+    test('falls back to assistantConfig modelReasoningEffort when no node effort', async () => {
+      mockRunStreamed.mockResolvedValue({
+        events: (async function* () {
+          yield { type: 'item.completed', item: { type: 'agent_message', text: 'ok' } };
+          yield { type: 'turn.completed', usage: defaultUsage };
+        })(),
+      });
+
+      for await (const _ of client.sendQuery('x', '/workspace', undefined, {
+        assistantConfig: { modelReasoningEffort: 'low' },
+      })) {
+        // drain
+      }
+
+      const threadOptions = mockStartThread.mock.calls[0]?.[0] as { modelReasoningEffort?: string };
+      expect(threadOptions.modelReasoningEffort).toBe('low');
     });
 
     test('captures the new-thread id from the thread.started event (resumable sessionId)', async () => {

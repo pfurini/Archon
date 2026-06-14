@@ -205,6 +205,42 @@ describe('ClaudeTerminalProvider', () => {
     expect(paste?.[0]).toContain('JSON');
   });
 
+  it('passes node effort through to the launch command as --effort', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'archon-ct-'));
+    const tpath = join(dir, 'sess.jsonl');
+    const driver = new FakeDriver([IDLE_SCREEN], () => writeFileSync(tpath, TURN_LINES));
+    const provider = new ClaudeTerminalProvider({
+      createClient: () => driver,
+      resolveBinary: async () => '/fake/claude',
+      findTranscript: async () => (existsSync(tpath) ? tpath : null),
+      sleep: async () => {},
+    });
+
+    await drain(provider.sendQuery('do it', '/work', undefined, { nodeConfig: { effort: 'max' } }));
+
+    const startCmd = driver.calls.find(c => c.m === 'start')?.segments?.[0] ?? '';
+    // claude-terminal's effort map is identity, so canonical 'max' stays 'max'.
+    expect(startCmd).toContain('--effort');
+    expect(startCmd).toContain('max');
+  });
+
+  it('omits --effort from the launch command when no node effort is set', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'archon-ct-'));
+    const tpath = join(dir, 'sess.jsonl');
+    const driver = new FakeDriver([IDLE_SCREEN], () => writeFileSync(tpath, TURN_LINES));
+    const provider = new ClaudeTerminalProvider({
+      createClient: () => driver,
+      resolveBinary: async () => '/fake/claude',
+      findTranscript: async () => (existsSync(tpath) ? tpath : null),
+      sleep: async () => {},
+    });
+
+    await drain(provider.sendQuery('do it', '/work'));
+
+    const startCmd = driver.calls.find(c => c.m === 'start')?.segments?.[0] ?? '';
+    expect(startCmd).not.toContain('--effort');
+  });
+
   it('aborts cleanly and still stops the session', async () => {
     const controller = new AbortController();
     controller.abort();

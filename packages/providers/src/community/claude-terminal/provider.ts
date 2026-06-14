@@ -36,6 +36,7 @@ import type {
   SystemPromptInput,
 } from '../../types';
 import { resolveClaudeBinaryPath } from '../../claude/binary-resolver';
+import { mapEffort } from '../../effort';
 import {
   augmentPromptForJsonSchema,
   tryParseStructuredOutput,
@@ -179,6 +180,10 @@ export class ClaudeTerminalProvider implements IAgentProvider {
       sessionId,
       resume: isResume,
       model: requestOptions?.model ?? config.model,
+      // Canonical Archon effort (low/medium/high/max) → native `--effort` value.
+      // claude-terminal's map is identity, but route through mapEffort so the
+      // central table stays the single source of truth.
+      effort: mapEffort(nodeConfig?.effort, 'claude-terminal'),
       appendSystemPrompt: systemPromptAppend(requestOptions?.systemPrompt),
       allowedTools: nodeConfig?.allowed_tools,
       disallowedTools: nodeConfig?.denied_tools,
