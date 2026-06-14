@@ -284,6 +284,17 @@ type NodeExecutionResult = NodeOutput & {
   loopIterations?: number;
 };
 
+/**
+ * Per-node result returned from the layer map. `provider` is the node's resolved
+ * provider id, carried so the executor only threads a session id to the next
+ * sequential node when it ran on the SAME provider (cross-provider guard).
+ */
+interface LayerNodeResult {
+  nodeId: string;
+  output: NodeExecutionResult;
+  provider?: string;
+}
+
 /** Throttle state for cancel checks (reads — no write contention in WAL mode) */
 const lastNodeCancelCheck = new Map<string, number>();
 const CANCEL_CHECK_INTERVAL_MS = 10_000;
@@ -2937,6 +2948,11 @@ export async function executeDagWorkflow(
   // Session threading: for sequential single-node layers, thread the session forward.
   // For parallel layers (>1 node), always fresh (can't share a session).
   let lastSequentialSessionId: string | undefined;
+  // Provider that produced lastSequentialSessionId. A provider session id is only
+  // resumable by the SAME provider that created it, so we must not thread a session
+  // across a provider boundary (e.g. cursor → claude-terminal): the downstream
+  // provider would attempt --resume <id> against a session it never created.
+  let lastSequentialSessionProvider: string | undefined;
   // Note: all four usage accumulators cover this invocation only. If this is a
   // resume, nodes skipped from the prior run are not included — cost, tokens,
   // and loop iterations all reflect the resumed portion only.
@@ -2958,11 +2974,12 @@ export async function executeDagWorkflow(
 
     if (isParallelLayer) {
       lastSequentialSessionId = undefined; // reset — parallel nodes can't share sessions
+      lastSequentialSessionProvider = undefined;
     }
 
     // Execute all nodes in the layer concurrently
     const layerResults = await Promise.allSettled(
-      layer.map(async (node): Promise<{ nodeId: string; output: NodeExecutionResult }> => {
+      layer.map(async (node): Promise<LayerNodeResult> => {
         try {
           // 0. Skip if this node completed successfully in a prior run (resume path).
           // `always_run: true` opts the node out of resume caching — re-execute even
@@ -3196,7 +3213,7 @@ export async function executeDagWorkflow(
               config,
               issueContext
             );
-            return { nodeId: node.id, output };
+            return { nodeId: node.id, output, provider: loopProvider };
           }
 
           // 3c. Approval node dispatch — pauses workflow for human review
@@ -3300,9 +3317,28 @@ export async function executeDagWorkflow(
           // a parallel-layer node CAN still use persist_session — it just doesn't share with siblings.
           const isFreshSequential = isParallelLayer || node.context === 'fresh';
           const bypassesPersistence = node.context === 'fresh';
-          let resumeSessionId: string | undefined = isFreshSequential
-            ? undefined
-            : lastSequentialSessionId;
+          // Cross-provider guard: an in-run session id is only resumable by the
+          // provider that created it. If the previous sequential node ran on a
+          // different provider, inheriting its session id would make this provider
+          // attempt --resume <id> (or equivalent) against a session it never
+          // created (e.g. claude-terminal hanging on the "Resume session" picker).
+          // Force a fresh session on the provider boundary.
+          const crossesProviderBoundary =
+            !isFreshSequential &&
+            lastSequentialSessionId !== undefined &&
+            lastSequentialSessionProvider !== provider;
+          if (crossesProviderBoundary) {
+            getLog().debug(
+              {
+                nodeId: node.id,
+                previousProvider: lastSequentialSessionProvider,
+                currentProvider: provider,
+              },
+              'dag.session_reset_provider_boundary'
+            );
+          }
+          let resumeSessionId: string | undefined =
+            isFreshSequential || crossesProviderBoundary ? undefined : lastSequentialSessionId;
 
           const nodePersistFlag = 'persist_session' in node ? node.persist_session : undefined;
           // Strictly opt-in: off unless the node sets persist_session, or the workflow
@@ -3499,7 +3535,7 @@ export async function executeDagWorkflow(
             }
           }
 
-          return { nodeId: node.id, output };
+          return { nodeId: node.id, output, provider };
         } catch (error) {
           const err = error as Error;
           getLog().error({ err, nodeId: node.id }, 'dag_node_pre_execution_failed');
@@ -3539,7 +3575,7 @@ export async function executeDagWorkflow(
     let layerHadFailure = false;
     for (const result of layerResults) {
       if (result.status === 'fulfilled') {
-        const { nodeId, output } = result.value;
+        const { nodeId, output, provider: nodeProvider } = result.value;
         // SINGLE aggregation point for run-level usage telemetry. Per-node
         // cost/tokens must be summed here and ONLY here — adding a per-node
         // telemetry capture elsewhere would double-count against the totals
@@ -3587,6 +3623,10 @@ export async function executeDagWorkflow(
         }
         if (output.state === 'completed' && !isParallelLayer && output.sessionId !== undefined) {
           lastSequentialSessionId = output.sessionId;
+          // Track the producing provider so the next sequential node only inherits
+          // this session id when it resolves to the SAME provider (see the
+          // cross-provider guard in the session-determination block above).
+          lastSequentialSessionProvider = nodeProvider;
         }
         if (output.state === 'failed') layerHadFailure = true;
       } else {

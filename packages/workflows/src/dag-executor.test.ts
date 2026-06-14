@@ -38,13 +38,25 @@ mock.module('@archon/paths', () => ({
 }));
 
 // --- Bootstrap provider registry (after path mocks, before dag-executor import) ---
-import { registerBuiltinProviders, registerPiProvider, clearRegistry } from '@archon/providers';
+import {
+  registerBuiltinProviders,
+  registerPiProvider,
+  registerCursorProvider,
+  registerClaudeTerminalProvider,
+  clearRegistry,
+} from '@archon/providers';
 clearRegistry();
 registerBuiltinProviders();
 // Pi is a community provider (best-effort structured output) — register it so the
 // reask-loop tests can resolve `getProviderCapabilities('pi')` to 'best-effort'.
 // deps.getAgentProvider is mocked, so the real Pi SDK is never loaded.
 registerPiProvider();
+// Cursor + Claude-terminal community providers — registered so the cross-provider
+// session-threading regression tests can resolve two distinct providers without
+// `resolveNodeProviderAndModel` throwing. deps.getAgentProvider is mocked, so the
+// real SDKs are never loaded.
+registerCursorProvider();
+registerClaudeTerminalProvider();
 
 // --- Imports (after mocks) ---
 import {
@@ -8976,6 +8988,113 @@ describe('executeDagWorkflow -- typed artifacts (output_type)', () => {
       wrote = false;
     }
     expect(wrote).toBe(false);
+  });
+});
+
+describe('executeDagWorkflow -- cross-provider session threading', () => {
+  // Regression: in-run `lastSequentialSessionId` was threaded to the next
+  // sequential node WITHOUT checking the producing node ran on the same provider.
+  // On a provider change (e.g. cursor → claude-terminal) the downstream provider
+  // received a foreign session id and attempted --resume <id> against a session it
+  // never created (claude-terminal hangs on the "Resume session" picker, times out).
+  // The fix forces a fresh session on a provider boundary.
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(tmpdir(), `dag-xprov-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(join(testDir, '.archon', 'commands'), { recursive: true });
+
+    mockSendQueryDag.mockClear();
+    mockGetAgentProviderDag.mockClear();
+    // Distinct session id per call so we can prove which (if any) is inherited.
+    let callCount = 0;
+    mockSendQueryDag.mockImplementation(function* () {
+      callCount++;
+      yield { type: 'assistant', content: 'AI response' };
+      yield { type: 'result', sessionId: `sid-${String(callCount)}` };
+    });
+  });
+
+  afterEach(async () => {
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    }));
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup errors
+    }
+  });
+
+  it('does NOT inherit the prior session id when the provider changes between sequential nodes', async () => {
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'xprov-sequential',
+        nodes: [
+          { id: 'a', prompt: 'Step A', provider: 'cursor' },
+          { id: 'b', prompt: 'Step B', provider: 'claude-terminal', depends_on: ['a'] },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(mockSendQueryDag.mock.calls.length).toBe(2);
+    // Node A (cursor) runs fresh (no prior sequential session).
+    expect(mockSendQueryDag.mock.calls[0][2]).toBeUndefined();
+    // Node B (claude-terminal) must NOT receive node A's cursor session id —
+    // the provider boundary forces a fresh session.
+    expect(mockSendQueryDag.mock.calls[1][2]).toBeUndefined();
+  });
+
+  it('still inherits the prior session id for a same-provider sequential pair (no regression)', async () => {
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'sameprov-sequential',
+        nodes: [
+          { id: 'a', prompt: 'Step A', provider: 'cursor' },
+          { id: 'b', prompt: 'Step B', provider: 'cursor', depends_on: ['a'] },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(mockSendQueryDag.mock.calls.length).toBe(2);
+    // Node A (cursor) runs fresh.
+    expect(mockSendQueryDag.mock.calls[0][2]).toBeUndefined();
+    // Node B (cursor) inherits node A's session id — continuity preserved.
+    expect(mockSendQueryDag.mock.calls[1][2]).toBe('sid-1');
   });
 });
 
