@@ -155,6 +155,42 @@ export interface OpencodeProviderDefaults {
   agent?: string;
 }
 
+/**
+ * Community provider defaults for claude-terminal — the interactive Claude Code
+ * TUI driven via @mariozechner/terminalcp, with structured data read from the
+ * on-disk session transcript. Minimal v1 shape; extend as capabilities are
+ * wired in.
+ */
+export interface ClaudeTerminalProviderDefaults {
+  [key: string]: unknown;
+  /** Model passed to `claude --model` at launch (e.g. 'sonnet', 'opus'). */
+  model?: string;
+  /**
+   * Absolute path to the Claude Code executable. Falls back to the shared
+   * claude binary resolver (`CLAUDE_BIN_PATH` / auto-detect) when unset.
+   */
+  claudeBinaryPath?: string;
+  /**
+   * How to invoke terminalcp (space-separated). Defaults to running the
+   * workspace-installed terminalcp by its resolved entry with the current JS
+   * runtime (works from any cwd). Override to use a different launcher.
+   */
+  terminalcpCommand?: string;
+  /** Max wall-clock per turn before the provider aborts the TUI session (ms). */
+  turnTimeoutMs?: number;
+  /** Transcript/screen poll interval while awaiting a turn (ms). */
+  pollIntervalMs?: number;
+  /**
+   * Stall watchdog: max ms without transcript progress (while no tool call is
+   * in flight) before the provider replaces the TUI process (`--resume` + a
+   * "continue" nudge). Must exceed the longest legitimate silent gap between
+   * transcript writes (auto-compaction, one long thinking block). Default 4 min.
+   */
+  stallTimeoutMs?: number;
+  /** Max stall recoveries per turn (0 disables the watchdog). Default 1. */
+  maxStallRecoveries?: number;
+}
+
 /** Generic per-provider defaults bag used by config surfaces and UI. */
 export type ProviderDefaults = Record<string, unknown>;
 

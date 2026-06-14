@@ -146,7 +146,7 @@ const mockCodexCapabilities = () => ({
   structuredOutput: 'enforced' as const,
   envInjection: true,
   costControl: false,
-  effortControl: false,
+  effortControl: true,
   thinkingControl: false,
   fallbackModel: false,
   sandbox: false,
@@ -7453,7 +7453,47 @@ describe('executeDagWorkflow -- Claude SDK advanced options', () => {
     expect(nodeConfig?.effort).toBe('max');
   });
 
-  it('warns user when Codex node has Claude-only options (effort)', async () => {
+  it('does NOT warn when Codex node uses effort (now routed to modelReasoningEffort)', async () => {
+    // Codex gained node-level effort support (effortControl: true) — node `effort:`
+    // maps to modelReasoningEffort (max → xhigh), so it must no longer warn.
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'codex',
+      getCapabilities: mockCodexCapabilities,
+    }));
+
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'codex-effort-supported-test',
+        nodes: [{ id: 'step1', command: 'my-cmd', provider: 'codex', effort: 'high' }],
+      },
+      workflowRun,
+      'codex',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      { ...minimalConfig, assistant: 'codex' }
+    );
+
+    const sendMessage = platform.sendMessage as ReturnType<typeof mock>;
+    const messages = sendMessage.mock.calls.map((call: unknown[]) => call[1] as string);
+    const warning = messages.find(
+      m => m.includes('effort') && m.toLowerCase().includes("doesn't support")
+    );
+    expect(warning).toBeUndefined();
+  });
+
+  it('warns user when Codex node has a genuinely Claude-only option (thinking)', async () => {
     mockGetAgentProviderDag.mockImplementation(() => ({
       sendQuery: mockSendQueryDag,
       getType: () => 'codex',
@@ -7471,7 +7511,7 @@ describe('executeDagWorkflow -- Claude SDK advanced options', () => {
       testDir,
       {
         name: 'codex-claude-opts-test',
-        nodes: [{ id: 'step1', command: 'my-cmd', provider: 'codex', effort: 'high' }],
+        nodes: [{ id: 'step1', command: 'my-cmd', provider: 'codex', thinking: 'enabled' }],
       },
       workflowRun,
       'codex',
@@ -7485,7 +7525,7 @@ describe('executeDagWorkflow -- Claude SDK advanced options', () => {
 
     const sendMessage = platform.sendMessage as ReturnType<typeof mock>;
     const messages = sendMessage.mock.calls.map((call: unknown[]) => call[1] as string);
-    const warning = messages.find(m => m.includes('effort') && m.toLowerCase().includes('codex'));
+    const warning = messages.find(m => m.includes('thinking') && m.toLowerCase().includes('codex'));
     expect(warning).toBeDefined();
   });
 });

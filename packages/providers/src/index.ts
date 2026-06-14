@@ -37,6 +37,17 @@ export {
 // Error
 export { UnknownProviderError } from './errors';
 
+// Canonical effort scale + per-provider effort mapper (single source of truth for
+// translating a portable `effort:` level into each provider's native vocabulary).
+export {
+  ARCHON_EFFORT_LEVELS,
+  EFFORT_MAPS,
+  isArchonEffort,
+  mapEffort,
+  type ArchonEffort,
+  type EffortMap,
+} from './effort';
+
 // Shared structured-output helpers (cross-provider; the dag-executor validates
 // every provider's output_format result against the declared schema).
 export {
@@ -91,6 +102,12 @@ export {
   resetCopilotSingleton,
   type CopilotProviderDefaults,
 } from './community/copilot';
+export {
+  ClaudeTerminalProvider,
+  parseClaudeTerminalConfig,
+  registerClaudeTerminalProvider,
+  type ClaudeTerminalProviderDefaults,
+} from './community/claude-terminal';
 export {
   resolveCopilotBinaryPath,
   fileExists as copilotFileExists,

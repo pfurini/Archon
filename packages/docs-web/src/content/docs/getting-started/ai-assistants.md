@@ -1,6 +1,6 @@
 ---
 title: AI Assistants
-description: Configure Claude Code, Codex, OpenCode, GitHub Copilot, and Pi as AI assistants for Archon.
+description: Configure Claude Code, Codex, OpenCode, GitHub Copilot, Pi, and terminal-driven Claude as AI assistants for Archon.
 category: getting-started
 area: clients
 audience: [user]
@@ -659,6 +659,73 @@ archon ai default codex --scope user
 ```
 
 The model-tier presets are the same ones you can hand-write in `~/.archon/config.yaml`; see [Configuration](/reference/configuration/) for the YAML format.
+
+## Claude (Terminal · Community Provider)
+
+**Terminal-automation community provider.** Instead of the Claude Agent SDK's headless `-p`/`stream-json` path (used by the built-in `claude` provider), `claude-terminal` drives the **interactive Claude Code TUI** under a pseudo-terminal via [`@mariozechner/terminalcp`](https://github.com/badlogic/terminalcp), and reads structured events from Claude Code's on-disk **session transcript** (`~/.claude/projects/<dashed-cwd>/<session-id>.jsonl`) — never by scraping the screen. Registered as `builtIn: false`.
+
+Use it when you want to run against the real interactive app (for example, to move off `-p`) while keeping Archon's streaming/observability contract. The built-in SDK `claude` provider remains the default.
+
+### Install
+
+`@mariozechner/terminalcp` is an **optionalDependency** of `@archon/providers` — `bun install` pulls it in automatically, and a root `postinstall` makes node-pty's prebuilt `spawn-helper` executable (it ships non-executable, which would otherwise break PTY allocation).
+
+Requirements:
+
+- **Node.js ≥ 20 on `PATH`** — terminalcp is a Node tool; Archon runs its daemon with `node` (not Bun).
+- **The Claude Code CLI installed** — the same binary as the built-in provider (see [Install Claude Code](#install-claude-code)).
+
+### Authenticate
+
+No separate authentication: `claude-terminal` launches your installed `claude` CLI, so it uses whatever Claude Code itself is logged into (a Claude Pro/Max subscription via `claude /login`, or env-var tokens) — the same credential source as the built-in provider.
+
+### Configuration Options
+
+```yaml
+# .archon/config.yaml
+assistants:
+  claude-terminal:
+    model: sonnet                  # passed to `claude --model`
+    claudeBinaryPath: /abs/claude  # optional; otherwise resolved from PATH
+    terminalcpCommand: ''          # optional; defaults to running the bundled terminalcp under node
+    turnTimeoutMs: 600000          # optional; max wall-clock per turn
+    pollIntervalMs: 800            # optional; transcript/screen poll cadence
+```
+
+Select it per workflow/node with `provider: claude-terminal`, or as the default via `DEFAULT_AI_ASSISTANT=claude-terminal`.
+
+### Supported Archon Features
+
+| Feature | Support | Notes |
+|---|---|---|
+| Session resume | ✅ | spawn-per-turn + `claude --resume` (appends to the same transcript) |
+| MCP servers | ✅ | `mcp: path/to/servers.json` → `--mcp-config` |
+| Skills | ✅ | auto-loaded from `.claude/skills` by the interactive CLI |
+| Tool restrictions | ✅ | `allowed_tools` / `denied_tools` → `--allowed-tools` / `--disallowed-tools` (verified enforced by the interactive TUI even with `--dangerously-skip-permissions`) |
+| Structured output | ✅ | best-effort: schema appended to the prompt, JSON extracted from the final transcript message; unparseable output degrades to the dag-executor's missing-output warning |
+| System prompt override | ✅ | `systemPrompt:` → `--append-system-prompt` |
+| Codebase env vars (`envInjection`) | ✅ | injected into the spawned TUI's environment |
+| Cost limits (`maxBudgetUsd`) | ❌ | no budget cap in the interactive TUI |
+| Effort control | ✅ | node `effort:` (`low`/`medium`/`high`/`max`) → the interactive `--effort` launch flag |
+| Thinking control | ❌ | not settable via a launch flag (thinking output is still captured) |
+| Fallback model | ❌ | no `--fallback-model` |
+| Sandbox | ❌ | not exposed by the TUI; Archon uses worktree isolation |
+| Hooks | ❌ | SDK in-process hook callbacks have no interactive-TUI equivalent |
+| Inline agents (`agents:`) | ❌ | inline definitions need the SDK's `options.agents` |
+| In-process native tools | ❌ | the orchestrator's bash run-management prompt is used instead (as for Codex/OpenCode/Copilot) |
+
+### Notes & caveats
+
+- **Spawn-per-turn**: each turn boots a fresh `claude` session (loads CLAUDE.md/skills/MCP), so there is a per-turn startup cost — chosen for lifecycle safety (no orphaned PTY processes).
+- **Your global Claude Code config is active** in the spawned TUI (statusline, plugins, "what's new"/rating panels). Archon reads data only from the transcript, so screen chrome does not affect results; the provider clears the input box before pasting to avoid plugin-injected text.
+- **First run in a new directory** triggers Claude Code's folder-trust dialog; the provider auto-accepts it.
+- **`denied_tools` removes *named* tools, it is not a sandbox.** Archon launches the TUI with `--dangerously-skip-permissions`, so `--disallowed-tools` is the only tool guard: a denied tool is genuinely unavailable to the model (verified — denying `Bash` leaves the model unable to run shell commands), but every tool you *don't* deny still runs without a permission prompt. Restrict tools explicitly; rely on worktree isolation, not the TUI, for a true execution boundary.
+- **Dead-session fail-fast**: if the spawned `claude` process dies mid-turn (a crash, or a Claude session/usage-limit notice that ends the CLI), the provider detects the stopped session via terminalcp and errors out promptly instead of waiting for `turnTimeoutMs`.
+
+### See also
+
+- [Adding a Community Provider](../contributing/adding-a-community-provider/)
+- [`@mariozechner/terminalcp`](https://github.com/badlogic/terminalcp) — the terminal-automation library.
 
 ## How Assistant Selection Works
 

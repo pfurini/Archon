@@ -355,7 +355,12 @@ nodes:
     command: implement-changes      # Inherits workflow-level model
 ```
 
-Loop nodes accept `provider`/`model` without error but ignore them at runtime.
+Loop nodes also honor per-node `provider`/`model` — the executor resolves them
+(including tier-keyword aliases like `large`/`medium`/`small`) and forwards the
+resolved spec to every iteration's AI call. Setting `model`/`provider` on a loop is
+real, not ignored. (Only the *other* AI fields — `hooks`, `mcp`, `skills`,
+`output_format`, `allowed_tools`, `denied_tools`, etc. — are ignored on loops; see
+the "What Does NOT Work on Loop Nodes" list below.)
 
 ## Resume on Failure
 
@@ -451,7 +456,9 @@ First iteration is always fresh regardless.
 - `retry` — **hard error** at parse time
 - `hooks`, `mcp`, `skills`, `allowed_tools`, `denied_tools`, `output_format` — silently ignored
 - `context: fresh` — ignored (use `loop.fresh_context` instead)
-- `provider`, `model` — accepted but ignored at runtime
+
+`provider` and `model` **do** work on loop nodes (resolved and forwarded to every
+iteration — see "Per-Node Provider and Model" above). They are NOT in the ignored set.
 
 ### Loop Output
 

@@ -217,7 +217,7 @@ nodes:
 | `mcp` | string | — | Path to MCP server config JSON file. Codex and Claude. See [MCP Servers](/guides/mcp-servers/) |
 | `skills` | string[] | — | Skills to preload. Claude only. See [Skills](/guides/skills/) |
 | `agents` | object | — | Inline sub-agent definitions keyed by kebab-case ID. Claude only. See [Inline sub-agents](#inline-sub-agents) |
-| `effort` | `'low'`\|`'medium'`\|`'high'`\|`'max'` | — | Reasoning depth. Claude only. Also settable at workflow level |
+| `effort` | `'low'`\|`'medium'`\|`'high'`\|`'max'` | — | Portable reasoning depth — mapped to each provider's native vocabulary (Claude `effort`, claude-terminal `--effort`, Codex `modelReasoningEffort` with `max`→`xhigh`, Pi/Copilot thinking levels; OpenCode unsupported; loop nodes ignore it). Also settable at workflow level |
 | `thinking` | string \| object | — | Thinking mode: `'adaptive'`, `'disabled'`, or `{type:'enabled', budgetTokens:N}`. Claude only. Also settable at workflow level |
 | `maxBudgetUsd` | number | — | USD cost cap; node fails if exceeded. Claude only. Per-node only |
 | `systemPrompt` | string | — | Override the default `claude_code` system prompt for this node. Claude only. Per-node only |
@@ -1343,7 +1343,7 @@ Before deploying a workflow:
 11. **`mcp:`** — attach per-node MCP servers via JSON config (Codex and Claude)
 12. **`skills:`** — preload skills into Claude nodes for domain expertise
 13. **`agents:`** — inline Claude sub-agent definitions invokable via the `Task` tool
-14. **`effort` / `thinking`** — control reasoning depth and thinking mode per node or workflow (Claude only)
+14. **`effort`** — portable reasoning depth per node or workflow, mapped to each provider's native vocabulary (Claude / claude-terminal / Codex / Pi / Copilot; `max`→`xhigh` where a provider has no `max` rung; OpenCode unsupported). **`thinking`** — thinking mode (Claude only)
 15. **`maxBudgetUsd`** — set a USD cost cap per node; fails with error if exceeded (Claude only)
 16. **`systemPrompt`** — override the default system prompt per node (Claude only)
 17. **`sandbox`** — OS-level filesystem/network restrictions per node or workflow (Claude only)

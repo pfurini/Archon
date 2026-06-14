@@ -20,6 +20,7 @@ import type {
 import { parseCodexConfig } from './config';
 import { CODEX_CAPABILITIES } from './capabilities';
 import { resolveCodexBinaryPath } from './binary-resolver';
+import { mapEffort } from '../effort';
 import { createLogger } from '@archon/paths';
 import { loadMcpConfig } from '../mcp/config';
 import {
@@ -78,9 +79,16 @@ async function getCodex(configCodexBinaryPath?: string): Promise<Codex> {
 function buildThreadOptions(
   cwd: string,
   model?: string,
-  assistantConfig?: Record<string, unknown>
+  assistantConfig?: Record<string, unknown>,
+  nodeEffort?: string
 ): ThreadOptions {
   const config = parseCodexConfig(assistantConfig ?? {});
+  // A node-level `effort:` (canonical low/medium/high/max) overrides the config
+  // default, clamped to Codex's vocabulary (max → xhigh) via the central mapper.
+  // The map only emits valid modelReasoningEffort values, so the cast is sound.
+  const nodeReasoningEffort = mapEffort(nodeEffort, 'codex') as
+    | ThreadOptions['modelReasoningEffort']
+    | undefined;
   return {
     workingDirectory: cwd,
     skipGitRepoCheck: true,
@@ -88,7 +96,7 @@ function buildThreadOptions(
     networkAccessEnabled: true,
     approvalPolicy: 'never',
     model: model ?? config.model,
-    modelReasoningEffort: config.modelReasoningEffort,
+    modelReasoningEffort: nodeReasoningEffort ?? config.modelReasoningEffort,
     webSearchMode: config.webSearchMode,
     additionalDirectories: config.additionalDirectories,
   };
@@ -762,7 +770,12 @@ export class CodexProvider implements IAgentProvider {
       requestOptions?.env,
       codexConfigOverrides
     );
-    const threadOptions = buildThreadOptions(cwd, requestOptions?.model, assistantConfig);
+    const threadOptions = buildThreadOptions(
+      cwd,
+      requestOptions?.model,
+      assistantConfig,
+      requestOptions?.nodeConfig?.effort
+    );
 
     if (requestOptions?.abortSignal?.aborted) {
       throw new Error('Query aborted');

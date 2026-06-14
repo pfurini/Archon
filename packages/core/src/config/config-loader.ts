@@ -8,13 +8,13 @@
  * 4. Environment variables
  */
 
-import { readFile as fsReadFile, writeFile, mkdir } from 'fs/promises';
-import { join, dirname } from 'path';
 import {
   getArchonConfigPath,
   getArchonWorkspacesPath,
   getArchonWorktreesPath,
 } from '@archon/paths';
+import { readFile as fsReadFile, mkdir, writeFile } from 'fs/promises';
+import { dirname, join } from 'path';
 
 // Wrapper functions for file I/O - allows mocking without polluting fs/promises globally
 export async function readConfigFile(path: string): Promise<string> {
@@ -40,8 +40,8 @@ import type {
 } from './config-types';
 import { createLogger } from '@archon/paths';
 import {
-  isRegisteredProvider,
   getRegisteredProviders,
+  isRegisteredProvider,
   registerBuiltinProviders,
   registerCommunityProviders,
 } from '@archon/providers';
@@ -110,10 +110,14 @@ function mergeAssistantDefaults(
     }
   }
 
-  if (!overrides) return merged;
+  if (!overrides) {
+    return merged;
+  }
 
   for (const [providerId, providerDefaults] of Object.entries(overrides)) {
-    if (!providerDefaults || typeof providerDefaults !== 'object') continue;
+    if (!providerDefaults || typeof providerDefaults !== 'object') {
+      continue;
+    }
     merged[providerId] = {
       ...(merged[providerId] ?? {}),
       ...providerDefaults,
@@ -150,7 +154,9 @@ function toSafeAssistantDefaults(assistants: AssistantDefaults): SafeConfig['ass
   const safeAssistants: SafeConfig['assistants'] = {};
 
   for (const [providerId, providerDefaults] of Object.entries(assistants)) {
-    if (!providerDefaults || typeof providerDefaults !== 'object') continue;
+    if (!providerDefaults || typeof providerDefaults !== 'object') {
+      continue;
+    }
 
     const allowed = SAFE_ASSISTANT_FIELDS[providerId] ?? [];
     const safeDefaults: Record<string, unknown> = {};
@@ -170,7 +176,9 @@ function toSafeAssistantDefaults(assistants: AssistantDefaults): SafeConfig['ass
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
 function getLog(): ReturnType<typeof createLogger> {
-  if (!cachedLog) cachedLog = createLogger('config');
+  if (!cachedLog) {
+    cachedLog = createLogger('config');
+  }
   return cachedLog;
 }
 
@@ -193,7 +201,8 @@ const DEFAULT_CONFIG_CONTENT = `# Archon Global Configuration
 # Bot display name (shown in messages)
 # botName: Archon
 
-# Default AI assistant (must match a registered provider, e.g. claude, codex)
+# Default AI assistant (must match a registered provider id).
+# Built-in: claude, codex. Community: opencode, pi, copilot, claude-terminal.
 # defaultAssistant: claude
 
 # Assistant defaults
@@ -452,7 +461,7 @@ function applyEnvOverrides(
   // Concurrency override
   const maxConcurrent = process.env.MAX_CONCURRENT_CONVERSATIONS;
   if (maxConcurrent) {
-    const parsed = parseInt(maxConcurrent, 10);
+    const parsed = Number.parseInt(maxConcurrent, 10);
     if (!isNaN(parsed) && parsed > 0) {
       config.concurrency.maxConversations = parsed;
     }
@@ -494,15 +503,25 @@ function mergeGlobalConfig(defaults: MergedConfig, global: GlobalConfig): Merged
 
   // Streaming preferences
   if (global.streaming) {
-    if (global.streaming.telegram) result.streaming.telegram = global.streaming.telegram;
-    if (global.streaming.discord) result.streaming.discord = global.streaming.discord;
-    if (global.streaming.slack) result.streaming.slack = global.streaming.slack;
+    if (global.streaming.telegram) {
+      result.streaming.telegram = global.streaming.telegram;
+    }
+    if (global.streaming.discord) {
+      result.streaming.discord = global.streaming.discord;
+    }
+    if (global.streaming.slack) {
+      result.streaming.slack = global.streaming.slack;
+    }
   }
 
   // Path preferences
   if (global.paths) {
-    if (global.paths.workspaces) result.paths.workspaces = global.paths.workspaces;
-    if (global.paths.worktrees) result.paths.worktrees = global.paths.worktrees;
+    if (global.paths.workspaces) {
+      result.paths.workspaces = global.paths.workspaces;
+    }
+    if (global.paths.worktrees) {
+      result.paths.worktrees = global.paths.worktrees;
+    }
   }
 
   // Concurrency preferences
@@ -653,8 +672,12 @@ export async function updateGlobalConfig(
     // Deep-merge: only overwrite defined keys
     const merged: GlobalConfig = { ...current };
 
-    if (updates.botName !== undefined) merged.botName = updates.botName;
-    if (updates.defaultAssistant !== undefined) merged.defaultAssistant = updates.defaultAssistant;
+    if (updates.botName !== undefined) {
+      merged.botName = updates.botName;
+    }
+    if (updates.defaultAssistant !== undefined) {
+      merged.defaultAssistant = updates.defaultAssistant;
+    }
 
     if (updates.assistants) {
       merged.assistants = mergeAssistantDefaults(

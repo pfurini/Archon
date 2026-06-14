@@ -5,11 +5,12 @@
  * return value so a doctor failure does not abort setup (the env file was
  * already written successfully).
  */
-import { mkdirSync, writeFileSync, rmSync, existsSync } from 'fs';
-import { join } from 'path';
-import { homedir } from 'os';
+
 import { execFileAsync } from '@archon/git';
-import { BUNDLED_IS_BINARY, getArchonHome, createLogger, getTelemetryStatus } from '@archon/paths';
+import { BUNDLED_IS_BINARY, createLogger, getArchonHome, getTelemetryStatus } from '@archon/paths';
+import { existsSync, mkdirSync, rmSync, writeFileSync } from 'fs';
+import { homedir } from 'os';
+import { join } from 'path';
 
 // Env vars that indicate a Pi backend API key is configured. Keep in sync with
 // `PI_BACKENDS` in setup.ts — these are the auth signals checkPi inspects.
@@ -27,14 +28,16 @@ const PI_API_KEY_VARS = [
 
 let cachedLog: ReturnType<typeof createLogger> | undefined;
 function getLog(): ReturnType<typeof createLogger> {
-  if (!cachedLog) cachedLog = createLogger('cli.doctor');
+  if (!cachedLog) {
+    cachedLog = createLogger('cli.doctor');
+  }
   return cachedLog;
 }
 
 export interface CheckResult {
   label: string;
-  status: 'pass' | 'fail' | 'skip';
   message: string;
+  status: 'pass' | 'fail' | 'skip';
 }
 
 export async function checkClaudeBinary(
@@ -45,7 +48,11 @@ export async function checkClaudeBinary(
 ): Promise<CheckResult> {
   const label = 'Claude binary';
   if (!isBinary) {
-    return { label, status: 'skip', message: 'dev mode (SDK resolves via node_modules)' };
+    return {
+      label,
+      status: 'skip',
+      message: 'dev mode (SDK resolves via node_modules)',
+    };
   }
   const path = env.CLAUDE_BIN_PATH;
   if (!path) {
@@ -71,8 +78,12 @@ export async function checkGhAuth(env: NodeJS.ProcessEnv): Promise<CheckResult> 
   const label = 'gh CLI';
   // Skip for users without GitHub configured — gh auth is irrelevant
   // to a CLI-only or Slack/Telegram setup, so reporting fail would be noise.
-  if (!env.GITHUB_TOKEN && !env.GH_TOKEN) {
-    return { label, status: 'skip', message: 'GitHub not configured (no GITHUB_TOKEN)' };
+  if (!(env.GITHUB_TOKEN || env.GH_TOKEN)) {
+    return {
+      label,
+      status: 'skip',
+      message: 'GitHub not configured (no GITHUB_TOKEN)',
+    };
   }
   try {
     await execFileAsync('gh', ['auth', 'status'], { timeout: 10_000 });
@@ -125,9 +136,43 @@ export async function checkPi(env: NodeJS.ProcessEnv): Promise<CheckResult> {
   };
 }
 
+export async function checkClaudeTerminal(env: NodeJS.ProcessEnv): Promise<CheckResult> {
+  const label = 'Claude Terminal provider';
+
+  // Skip unless claude-terminal is the configured default. This community
+  // provider drives the interactive `claude` TUI via terminalcp; probing its
+  // dependencies for users on the SDK-based `claude` (or another) provider
+  // would be noise. Mirrors the checkPi gate.
+  if (env.DEFAULT_AI_ASSISTANT !== 'claude-terminal') {
+    return { label, status: 'skip', message: 'Claude Terminal not configured' };
+  }
+
+  // The provider spawns the interactive `claude` CLI directly under terminalcp
+  // (resolved from the `claudeBinaryPath` config override, else PATH via
+  // `Bun.which('claude')`). The CLI is the one hard, user-fixable dependency —
+  // terminalcp itself auto-falls back to `npx @mariozechner/terminalcp`. Probe
+  // the PATH binary; a configured `claudeBinaryPath` override isn't visible here.
+  try {
+    await execFileAsync('claude', ['--version'], { timeout: 5000 });
+    return {
+      label,
+      status: 'pass',
+      message: 'claude CLI on PATH (spawns OK); terminalcp falls back to npx',
+    };
+  } catch (err) {
+    return {
+      label,
+      status: 'fail',
+      message:
+        `claude CLI not runnable on PATH: ${(err as Error).message}. ` +
+        'Install Claude Code, or set assistants.claude-terminal.claudeBinaryPath in config.',
+    };
+  }
+}
+
 export interface DatabaseDeps {
-  pool: { query: (sql: string) => Promise<unknown> };
   getDatabaseType: () => string;
+  pool: { query: (sql: string) => Promise<unknown> };
 }
 
 export async function checkDatabase(
@@ -156,7 +201,11 @@ export async function checkDatabase(
     return { label, status: 'pass', message: `reachable (${dbType})` };
   } catch (err) {
     getLog().error({ err }, 'doctor.db_query_failed');
-    return { label, status: 'fail', message: `not reachable: ${(err as Error).message}` };
+    return {
+      label,
+      status: 'fail',
+      message: `not reachable: ${(err as Error).message}`,
+    };
   }
 }
 
@@ -175,7 +224,11 @@ export async function checkWorkspaceWritable(): Promise<CheckResult> {
     mkdirSync(home, { recursive: true });
     writeFileSync(probe, 'ok');
   } catch (err) {
-    return { label, status: 'fail', message: `${home} not writable: ${(err as Error).message}` };
+    return {
+      label,
+      status: 'fail',
+      message: `${home} not writable: ${(err as Error).message}`,
+    };
   }
   try {
     rmSync(probe, { force: true });
@@ -200,7 +253,11 @@ export async function checkBundledDefaults(): Promise<CheckResult> {
       message: `${workflows} workflow(s), ${commands} command(s) loaded`,
     };
   } catch (err) {
-    return { label, status: 'fail', message: `failed to load: ${(err as Error).message}` };
+    return {
+      label,
+      status: 'fail',
+      message: `failed to load: ${(err as Error).message}`,
+    };
   }
 }
 
@@ -222,7 +279,11 @@ export async function checkTelemetry(): Promise<CheckResult> {
     CI: 'CI=true (auto-disabled)',
     POSTHOG_API_KEY: 'POSTHOG_API_KEY set to an opt-out value',
   };
-  return { label, status: 'skip', message: `disabled (${reasonText[status.disabledReason]})` };
+  return {
+    label,
+    status: 'skip',
+    message: `disabled (${reasonText[status.disabledReason]})`,
+  };
 }
 
 export async function checkSlack(env: NodeJS.ProcessEnv): Promise<CheckResult> {
@@ -241,7 +302,11 @@ export async function checkSlack(env: NodeJS.ProcessEnv): Promise<CheckResult> {
     if (body.ok) {
       return { label, status: 'pass', message: 'auth.test OK' };
     }
-    return { label, status: 'fail', message: `auth.test rejected: ${body.error ?? 'unknown'}` };
+    return {
+      label,
+      status: 'fail',
+      message: `auth.test rejected: ${body.error ?? 'unknown'}`,
+    };
   } catch (err) {
     // Network errors → skip, not fail — best-effort by design.
     return {
@@ -300,6 +365,7 @@ export async function doctorCommand(
         checkClaudeBinary(env),
         checkGhAuth(env),
         checkPi(env),
+        checkClaudeTerminal(env),
         checkDatabase(),
         checkWorkspaceWritable(),
         checkBundledDefaults(),
@@ -320,7 +386,9 @@ export async function doctorCommand(
       getLog().error({ reason: s.reason }, 'doctor.check_threw_unexpectedly');
       continue;
     }
-    if (s.value.status === 'fail') failures++;
+    if (s.value.status === 'fail') {
+      failures++;
+    }
     console.log(renderResult(s.value));
   }
 

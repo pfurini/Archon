@@ -10,7 +10,9 @@ export const CODEX_CAPABILITIES: ProviderCapabilities = {
   structuredOutput: 'enforced', // SDK outputSchema grammar-constrains decoding
   envInjection: true,
   costControl: false,
-  effortControl: false,
+  // Node-level `effort:` routes to `modelReasoningEffort` (max → xhigh) via the
+  // central effort mapper; see buildThreadOptions in provider.ts.
+  effortControl: true,
   thinkingControl: false,
   fallbackModel: false,
   sandbox: false,

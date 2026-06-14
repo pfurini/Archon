@@ -356,7 +356,7 @@ describe('resolveModelSpec — tier classification', () => {
   test("'large' returns preset for large tier", () => {
     const profile = buildAiProfile('claude');
     const spec = resolveModelSpec(profile, 'large');
-    expect(spec).toEqual({ provider: 'claude', model: 'opus' });
+    expect(spec).toEqual({ provider: 'claude', model: 'claude-opus-4-6[1m]' });
   });
 
   test("'medium' returns preset for medium tier", () => {
