@@ -176,9 +176,9 @@ export function Sidebar(): React.ReactElement {
       <div className="flex flex-col gap-3 p-4">
         <Link to="/legacy" className="flex items-center gap-2 hover:opacity-80 transition-opacity">
           <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary">
-            <span className="text-sm font-semibold text-primary-foreground">A</span>
+            <span className="text-sm font-semibold text-primary-foreground">F</span>
           </div>
-          <span className="text-base font-semibold text-text-primary">Archon</span>
+          <span className="text-base font-semibold text-text-primary">FuriAI</span>
         </Link>
       </div>
 

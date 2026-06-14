@@ -69,9 +69,9 @@ export function LoginPage(): React.ReactElement {
       <div className="w-full max-w-sm rounded-xl border border-border bg-surface p-8 shadow-lg">
         <div className="mb-6 flex items-center gap-2">
           <div className="flex h-8 w-8 items-center justify-center rounded-md bg-primary">
-            <span className="text-sm font-semibold text-primary-foreground">A</span>
+            <span className="text-sm font-semibold text-primary-foreground">F</span>
           </div>
-          <span className="text-base font-semibold text-text-primary">Archon</span>
+          <span className="text-base font-semibold text-text-primary">FuriAI</span>
         </div>
 
         <h1 className="mb-1 text-lg font-semibold text-text-primary">
@@ -82,7 +82,7 @@ export function LoginPage(): React.ReactElement {
             ? status?.signup === 'allowlist'
               ? 'Signup is invite-only — use an allowlisted email.'
               : 'Create an account to continue.'
-            : 'Sign in to your Archon workspace.'}
+            : 'Sign in to your FuriAI workspace.'}
         </p>
 
         {error && (

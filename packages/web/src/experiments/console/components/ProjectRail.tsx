@@ -161,7 +161,7 @@ export function ProjectRail({ onAddProject }: ProjectRailProps): ReactElement {
             className="shrink-0 select-none"
             draggable={false}
           />
-          <span className="brand-text text-base font-semibold tracking-tight">Archon</span>
+          <span className="brand-text text-base font-semibold tracking-tight">FuriAI</span>
           <span className="rounded-full border border-border px-2 py-0.5 font-mono text-[10px] uppercase tracking-widest text-text-tertiary">
             console
           </span>

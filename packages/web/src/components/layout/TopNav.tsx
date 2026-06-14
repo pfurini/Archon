@@ -54,9 +54,9 @@ export function TopNav(): React.ReactElement {
         className="flex items-center gap-2 mr-4 hover:opacity-80 transition-opacity"
       >
         <div className="flex h-7 w-7 items-center justify-center rounded-md bg-primary">
-          <span className="text-sm font-semibold text-primary-foreground">A</span>
+          <span className="text-sm font-semibold text-primary-foreground">F</span>
         </div>
-        <span className="text-sm font-semibold text-text-primary">Archon</span>
+        <span className="text-sm font-semibold text-text-primary">FuriAI</span>
       </Link>
 
       {tabs.map(({ to, end, icon: Icon, label }) => (
