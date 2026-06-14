@@ -14,6 +14,7 @@ import {
 import { registerPiProvider } from './community/pi/registration';
 import { registerCopilotProvider } from './community/copilot/registration';
 import { registerOpencodeProvider } from './community/opencode/registration';
+import { registerClaudeTerminalProvider } from './community/claude-terminal/registration';
 import { UnknownProviderError } from './errors';
 import type { ProviderRegistration, IAgentProvider, ProviderCapabilities } from './types';
 
@@ -259,6 +260,7 @@ describe('registry', () => {
       expect(isRegisteredProvider('opencode')).toBe(true);
       expect(isRegisteredProvider('pi')).toBe(true);
       expect(isRegisteredProvider('copilot')).toBe(true);
+      expect(isRegisteredProvider('claude-terminal')).toBe(true);
     });
 
     test('is idempotent', () => {
@@ -324,6 +326,45 @@ describe('registry', () => {
         .map(p => p.id)
         .sort();
       expect(ids).toEqual(['claude', 'codex', 'pi']);
+    });
+  });
+
+  describe('registerClaudeTerminalProvider (community provider)', () => {
+    test('registers claude-terminal with builtIn: false', () => {
+      registerClaudeTerminalProvider();
+      const reg = getRegistration('claude-terminal');
+      expect(reg.id).toBe('claude-terminal');
+      expect(reg.displayName).toBe('Claude Code (terminal · community)');
+      expect(reg.builtIn).toBe(false);
+    });
+
+    test('is idempotent', () => {
+      registerClaudeTerminalProvider();
+      expect(() => registerClaudeTerminalProvider()).not.toThrow();
+      expect(getRegisteredProviders().filter(p => p.id === 'claude-terminal')).toHaveLength(1);
+    });
+
+    test('declares honest capabilities (TUI-reachable true; SDK-only false)', () => {
+      registerClaudeTerminalProvider();
+      const caps = getProviderCapabilities('claude-terminal');
+      expect(caps.sessionResume).toBe(true);
+      expect(caps.mcp).toBe(true);
+      expect(caps.skills).toBe(true);
+      expect(caps.toolRestrictions).toBe(true);
+      expect(caps.structuredOutput).toBe('best-effort'); // tiered post-#19xx: prompt-augmented, not SDK-enforced
+      expect(caps.envInjection).toBe(true);
+      // SDK-runtime-only — no interactive-TUI equivalent
+      expect(caps.costControl).toBe(false);
+      expect(caps.fallbackModel).toBe(false);
+      expect(caps.sandbox).toBe(false);
+      expect(caps.hooks).toBe(false);
+      expect(caps.nativeTools).toBe(false);
+    });
+
+    test('appears in getProviderInfoList with builtIn: false', () => {
+      registerClaudeTerminalProvider();
+      const info = getProviderInfoList().find(p => p.id === 'claude-terminal');
+      expect(info?.builtIn).toBe(false);
     });
   });
 

@@ -7,25 +7,26 @@
  * testability. Avoids `mock.module()` because it is process-global and
  * irreversible in Bun, which would pollute other test files in this package.
  */
-import { describe, it, expect, spyOn, afterEach, beforeEach } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, it, spyOn } from 'bun:test';
+import * as git from '@archon/git';
+import { mkdirSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { mkdirSync, rmSync } from 'fs';
-import * as git from '@archon/git';
+import * as doctorModule from './doctor';
 import {
+  checkBundledDefaults,
   checkClaudeBinary,
+  checkClaudeTerminal,
   checkDatabase,
   checkGhAuth,
   checkPi,
-  checkWorkspaceWritable,
-  checkBundledDefaults,
   checkSlack,
   checkTelegram,
   checkTelemetry,
-  doctorCommand,
+  checkWorkspaceWritable,
   type DatabaseDeps,
+  doctorCommand,
 } from './doctor';
-import * as doctorModule from './doctor';
 
 describe('checkClaudeBinary', () => {
   let execSpy: ReturnType<typeof spyOn<typeof git, 'execFileAsync'>>;
@@ -65,6 +66,53 @@ describe('checkClaudeBinary', () => {
     const result = await checkClaudeBinary({ CLAUDE_BIN_PATH: '/opt/claude' }, true);
     expect(result.status).toBe('fail');
     expect(result.message).toContain('did not spawn');
+    expect(result.message).toContain('ENOENT');
+  });
+});
+
+describe('checkClaudeTerminal', () => {
+  let execSpy: ReturnType<typeof spyOn<typeof git, 'execFileAsync'>>;
+
+  beforeEach(() => {
+    execSpy = spyOn(git, 'execFileAsync');
+  });
+
+  afterEach(() => {
+    execSpy.mockRestore();
+  });
+
+  it('returns skip when claude-terminal is not the default assistant', async () => {
+    const result = await checkClaudeTerminal({
+      DEFAULT_AI_ASSISTANT: 'claude',
+    });
+    expect(result.status).toBe('skip');
+    expect(result.label).toBe('Claude Terminal provider');
+    expect(execSpy).not.toHaveBeenCalled();
+  });
+
+  it('returns skip when no default assistant is set', async () => {
+    const result = await checkClaudeTerminal({});
+    expect(result.status).toBe('skip');
+    expect(execSpy).not.toHaveBeenCalled();
+  });
+
+  it('returns pass when default and the claude CLI spawns', async () => {
+    execSpy.mockResolvedValue({ stdout: '2.1.166', stderr: '' });
+    const result = await checkClaudeTerminal({
+      DEFAULT_AI_ASSISTANT: 'claude-terminal',
+    });
+    expect(result.status).toBe('pass');
+    expect(result.message).toContain('claude CLI on PATH');
+    expect(execSpy).toHaveBeenCalledWith('claude', ['--version'], expect.any(Object));
+  });
+
+  it('returns fail when default but the claude CLI does not spawn', async () => {
+    execSpy.mockRejectedValue(new Error('ENOENT'));
+    const result = await checkClaudeTerminal({
+      DEFAULT_AI_ASSISTANT: 'claude-terminal',
+    });
+    expect(result.status).toBe('fail');
+    expect(result.message).toContain('claudeBinaryPath');
     expect(result.message).toContain('ENOENT');
   });
 });
@@ -284,7 +332,9 @@ describe('checkSlack', () => {
 
   it('returns pass when auth.test responds ok', async () => {
     fetchSpy.mockResolvedValue(
-      new Response(JSON.stringify({ ok: true }), { status: 200 }) as unknown as Response
+      new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+      }) as unknown as Response
     );
     const result = await checkSlack({ SLACK_BOT_TOKEN: 'xoxb-x' });
     expect(result.status).toBe('pass');
@@ -329,7 +379,9 @@ describe('checkTelegram', () => {
 
   it('returns pass when getMe responds ok', async () => {
     fetchSpy.mockResolvedValue(
-      new Response(JSON.stringify({ ok: true }), { status: 200 }) as unknown as Response
+      new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+      }) as unknown as Response
     );
     const result = await checkTelegram({ TELEGRAM_BOT_TOKEN: '123:abc' });
     expect(result.status).toBe('pass');
@@ -367,7 +419,9 @@ describe('checkTelemetry', () => {
 
   beforeEach(() => {
     saved = {};
-    for (const k of ENV_VARS) saved[k] = process.env[k];
+    for (const k of ENV_VARS) {
+      saved[k] = process.env[k];
+    }
     tmpHome = join(tmpdir(), `archon-doctor-tel-${process.pid}-${Date.now()}`);
     mkdirSync(tmpHome, { recursive: true });
     process.env.ARCHON_HOME = tmpHome;
@@ -375,8 +429,11 @@ describe('checkTelemetry', () => {
 
   afterEach(() => {
     for (const k of ENV_VARS) {
-      if (saved[k] === undefined) delete process.env[k];
-      else process.env[k] = saved[k];
+      if (saved[k] === undefined) {
+        delete process.env[k];
+      } else {
+        process.env[k] = saved[k];
+      }
     }
     rmSync(tmpHome, { recursive: true, force: true });
   });

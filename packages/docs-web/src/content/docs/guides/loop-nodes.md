@@ -310,11 +310,17 @@ nodes:
 - `skills` — skill preloading is not applied to loop iterations
 - `allowed_tools` / `denied_tools` — tool restrictions are not enforced on loop iterations
 - `output_format` — structured JSON output is not supported for loop nodes
-- `provider` / `model` — accepted in YAML without error but silently ignored at runtime. Loop nodes always use the workflow-level provider and model.
 
 These fields (except `retry`) are silently discarded at parse time with a
 loader warning — the workflow still loads but the fields have no effect.
 `retry` is the exception: it causes a hard load error.
+
+`provider` and `model` are **not** in this list — they work on loop nodes. The
+executor resolves a per-node loop `model:`/`provider:` (tier-keyword aliases such
+as `large`/`medium`/`small` included) and forwards the resolved spec to every
+iteration's AI call. They are deliberately excluded from `LOOP_NODE_AI_FIELDS`, so
+they do not emit a loader warning. Use a loop `model:` to run iterations on a
+different tier than the workflow default.
 
 The loop executor manages its own AI sessions independently from the standard
 node executor. If you need hooks, MCP, skills, or tool restrictions, consider
