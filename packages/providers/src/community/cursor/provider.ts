@@ -34,7 +34,7 @@ import {
 } from '../../shared/structured-output';
 
 import { CURSOR_CAPABILITIES } from './capabilities';
-import { parseCursorConfig } from './config';
+import { DEFAULT_CURSOR_MODEL, parseCursorConfig } from './config';
 import { redactSecrets } from './redact';
 import type {
   CursorSdkModule,
@@ -118,16 +118,10 @@ export class CursorProvider implements IAgentProvider {
     }
 
     const cfg = parseCursorConfig(requestOptions?.assistantConfig ?? {});
-    // tier/alias already resolved upstream into requestOptions.model.
-    const model = requestOptions?.model ?? cfg.model;
-    if (!model) {
-      yield errorResult(
-        'The Cursor provider requires a model — local Cursor agents have no default. ' +
-          'Set `model:` on the node/workflow, a tier, or assistants.cursor.model in config.',
-        'cursor_model_required'
-      );
-      return;
-    }
+    // tier/alias already resolved upstream into requestOptions.model; fall back
+    // to the config default, then the built-in default (local Cursor agents
+    // require a concrete model).
+    const model = requestOptions?.model ?? cfg.model ?? DEFAULT_CURSOR_MODEL;
 
     // Honor Archon's per-user key injection (requestOptions.env) first, then the
     // ambient process env. Passed inline to the SDK — never bound to a named

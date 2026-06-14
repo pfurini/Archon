@@ -214,19 +214,12 @@ describe('CursorProvider.sendQuery', () => {
     ]);
   });
 
-  it('fails fast with cursor_model_required when no model resolves', async () => {
-    const { sdk } = makeFakeSdk({ messages: [] });
+  it('falls back to the default model when none is specified', async () => {
+    const { sdk, calls } = makeFakeSdk({ messages: [asst('ok')] });
     const provider = new CursorProvider({ loadSdk: async () => sdk });
-    const chunks = await collect(
-      provider.sendQuery('x', '/repo', undefined, { env: { CURSOR_API_KEY: 'k' } })
-    );
-    expect(chunks).toEqual([
-      expect.objectContaining({
-        type: 'result',
-        isError: true,
-        errorSubtype: 'cursor_model_required',
-      }),
-    ]);
+    await collect(provider.sendQuery('x', '/repo', undefined, { env: { CURSOR_API_KEY: 'k' } }));
+    const opts = calls.options as { model: { id: string } };
+    expect(opts.model.id).toBe('composer-2.5');
   });
 
   it('fails fast with cursor_auth_missing when no API key is available', async () => {
