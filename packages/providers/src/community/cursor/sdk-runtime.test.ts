@@ -58,6 +58,28 @@ describe('installSdkRejectionGuard', () => {
     }
   });
 
+  it('absorbs a transient transport rejection (NGHTTP2 stream error) without forwarding', () => {
+    const forwarded: unknown[] = [];
+    const hostListener = (reason: unknown): void => {
+      forwarded.push(reason);
+    };
+    process.on('unhandledRejection', hostListener);
+    try {
+      installSdkRejectionGuard();
+      // Connect-RPC-shaped (matches looksLikeCursorSdkError via stack) AND
+      // transient (message → isTransientTransportRejection) ⟹ absorbed at debug,
+      // never forwarded. The SDK retries and the run completes.
+      const transientErr = new Error(
+        '[internal] Stream closed with error code NGHTTP2_FRAME_SIZE_ERROR'
+      );
+      transientErr.stack = `${transientErr.message}\n    at /x/node_modules/@connectrpc/connect-node/dist/index.js:1:1`;
+      process.emit('unhandledRejection', transientErr, Promise.resolve());
+      expect(forwarded).toHaveLength(0);
+    } finally {
+      process.removeListener('unhandledRejection', hostListener);
+    }
+  });
+
   it('is idempotent — a second install is a no-op', () => {
     installSdkRejectionGuard();
     expect(() => installSdkRejectionGuard()).not.toThrow();

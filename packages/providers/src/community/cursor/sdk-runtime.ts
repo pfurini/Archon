@@ -127,10 +127,18 @@ export function installSdkRejectionGuard(): void {
 
   installedRejectionGuard = (reason: unknown, promise: Promise<unknown>): void => {
     if (looksLikeCursorSdkError(reason)) {
-      if (!absorbedRejectionWarned) {
+      const detail = redactSecrets(reason instanceof Error ? reason.message : String(reason));
+      if (isTransientTransportRejection(reason)) {
+        // The SDK retries these (HTTP/2 frame errors, dropped/closed streams,
+        // connection resets) and the run still completes — they're benign
+        // background noise, not an actionable failure. Log at debug, never WARN,
+        // and don't consume the one-time WARN latch (so a later real auth/config
+        // rejection still surfaces).
+        getLog().debug({ detail }, 'cursor.sdk_rejection_absorbed');
+      } else if (!absorbedRejectionWarned) {
+        // Actionable (auth/config) — surface once at WARN.
         absorbedRejectionWarned = true;
-        const detail = reason instanceof Error ? reason.message : String(reason);
-        getLog().warn({ detail: redactSecrets(detail) }, 'cursor.sdk_rejection_absorbed');
+        getLog().warn({ detail }, 'cursor.sdk_rejection_absorbed');
       }
       return;
     }
@@ -184,6 +192,27 @@ function looksLikeCursorSdkError(reason: unknown): boolean {
     if (typeof err.stack === 'string' && /[/@](cursor[/-]sdk|connectrpc)/.test(err.stack)) {
       return true;
     }
+    current = err.cause;
+  }
+  return false;
+}
+
+/**
+ * True when an absorbed rejection is a transient network/transport hiccup the
+ * SDK retries (HTTP/2 frame errors, closed/reset streams, timeouts) rather than
+ * an actionable failure (bad key, config). Walks the `cause` chain and matches
+ * the message/code. Used to log these at debug instead of WARN — the run still
+ * completes, so a WARN would be misleading noise.
+ */
+function isTransientTransportRejection(reason: unknown): boolean {
+  const transient =
+    /NGHTTP2|ERR_HTTP2|stream closed|stream error|ECONNRESET|ETIMEDOUT|ECONNREFUSED|EPIPE|socket hang up|aborted/i;
+  let current: unknown = reason;
+  for (let depth = 0; depth < 6 && current; depth++) {
+    if (typeof current !== 'object') break;
+    const err = current as { message?: unknown; code?: unknown; cause?: unknown };
+    if (typeof err.message === 'string' && transient.test(err.message)) return true;
+    if (typeof err.code === 'string' && transient.test(err.code)) return true;
     current = err.cause;
   }
   return false;
