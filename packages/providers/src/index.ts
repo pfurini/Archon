@@ -109,6 +109,13 @@ export {
   type ClaudeTerminalProviderDefaults,
 } from './community/claude-terminal';
 export {
+  CursorProvider,
+  parseCursorConfig,
+  registerCursorProvider,
+  CURSOR_CAPABILITIES,
+  type CursorProviderDefaults,
+} from './community/cursor';
+export {
   resolveCopilotBinaryPath,
   fileExists as copilotFileExists,
 } from './community/copilot/binary-resolver';

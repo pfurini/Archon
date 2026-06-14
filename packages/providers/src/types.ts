@@ -191,6 +191,23 @@ export interface ClaudeTerminalProviderDefaults {
   maxStallRecoveries?: number;
 }
 
+/**
+ * Community provider defaults for Cursor (@cursor/sdk).
+ * Drives Cursor-routed models (Composer, Claude, GPT, Gemini, Grok) on one
+ * Cursor subscription / `CURSOR_API_KEY`. Minimal v1 shape; extend as
+ * capabilities are wired in.
+ */
+export interface CursorProviderDefaults {
+  [key: string]: unknown;
+  /**
+   * Model id passed to the SDK as `ModelSelection.id` (e.g. 'composer-1',
+   * 'claude-4.5-sonnet'). Local Cursor agents REQUIRE a model — when neither a
+   * workflow/tier model nor this default resolves, the provider fails fast
+   * rather than letting the SDK reject from a detached background task.
+   */
+  model?: string;
+}
+
 /** Generic per-provider defaults bag used by config surfaces and UI. */
 export type ProviderDefaults = Record<string, unknown>;
 

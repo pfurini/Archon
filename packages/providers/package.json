@@ -19,16 +19,18 @@
     "./community/copilot": "./src/community/copilot/index.ts",
     "./community/copilot/binary-resolver": "./src/community/copilot/binary-resolver.ts",
     "./community/claude-terminal": "./src/community/claude-terminal/index.ts",
+    "./community/cursor": "./src/community/cursor/index.ts",
     "./errors": "./src/errors.ts",
     "./registry": "./src/registry.ts"
   },
   "scripts": {
-    "test": "bun test src/effort.test.ts && bun test src/claude/provider.test.ts && bun test src/codex/provider.test.ts && bun test src/registry.test.ts && bun test src/codex/binary-guard.test.ts && bun test src/codex/binary-resolver.test.ts && bun test src/codex/binary-resolver-dev.test.ts && bun test src/claude/binary-resolver.test.ts && bun test src/claude/binary-resolver-dev.test.ts && bun test src/claude/native-tools.test.ts && bun test src/community/pi/model-ref.test.ts && bun test src/community/pi/config.test.ts && bun test src/community/pi/event-bridge.test.ts && bun test src/community/pi/options-translator.test.ts && bun test src/community/pi/session-resolver.test.ts && bun test src/community/pi/native-tools.test.ts && bun test src/community/pi/provider.test.ts && bun test src/community/pi/provider-lazy-load.test.ts && bun test src/community/pi/ui-context-stub.test.ts && bun test src/community/copilot/config.test.ts && bun test src/community/copilot/event-bridge.test.ts && bun test src/community/copilot/binary-resolver-dev.test.ts && bun test src/community/copilot/binary-resolver.test.ts && bun test src/community/copilot/provider.test.ts && bun test src/community/copilot/provider-lazy-load.test.ts && bun test src/community/copilot/provider-hardening.test.ts && bun test src/shared/structured-output.test.ts && bun test src/shared/skills.test.ts && bun test src/community/claude-terminal/",
+    "test": "bun test src/effort.test.ts && bun test src/claude/provider.test.ts && bun test src/codex/provider.test.ts && bun test src/registry.test.ts && bun test src/codex/binary-guard.test.ts && bun test src/codex/binary-resolver.test.ts && bun test src/codex/binary-resolver-dev.test.ts && bun test src/claude/binary-resolver.test.ts && bun test src/claude/binary-resolver-dev.test.ts && bun test src/claude/native-tools.test.ts && bun test src/community/pi/model-ref.test.ts && bun test src/community/pi/config.test.ts && bun test src/community/pi/event-bridge.test.ts && bun test src/community/pi/options-translator.test.ts && bun test src/community/pi/session-resolver.test.ts && bun test src/community/pi/native-tools.test.ts && bun test src/community/pi/provider.test.ts && bun test src/community/pi/provider-lazy-load.test.ts && bun test src/community/pi/ui-context-stub.test.ts && bun test src/community/copilot/config.test.ts && bun test src/community/copilot/event-bridge.test.ts && bun test src/community/copilot/binary-resolver-dev.test.ts && bun test src/community/copilot/binary-resolver.test.ts && bun test src/community/copilot/provider.test.ts && bun test src/community/copilot/provider-lazy-load.test.ts && bun test src/community/copilot/provider-hardening.test.ts && bun test src/shared/structured-output.test.ts && bun test src/shared/skills.test.ts && bun test src/community/claude-terminal/ && bun test src/community/cursor/",
     "type-check": "bun x tsc --noEmit"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.173",
     "@archon/paths": "workspace:*",
+    "@cursor/sdk": "^1.0.18",
     "@github/copilot-sdk": "~1.0.1",
     "@earendil-works/pi-ai": "^0.79.1",
     "@earendil-works/pi-coding-agent": "^0.79.1",
