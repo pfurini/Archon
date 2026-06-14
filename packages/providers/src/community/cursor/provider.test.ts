@@ -1,3 +1,7 @@
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
 import { describe, expect, it } from 'bun:test';
 
 import type { MessageChunk, SendQueryOptions } from '../../types';
@@ -176,6 +180,40 @@ describe('CursorProvider.sendQuery', () => {
         stopReason: 'stop',
       },
     ]);
+  });
+
+  it('passes MCP servers (env-expanded) and sandbox into the agent options', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cursor-mcp-'));
+    const mcpPath = join(dir, 'mcp.json');
+    writeFileSync(
+      mcpPath,
+      JSON.stringify({ mcpServers: { foo: { command: 'echo', env: { FLAG: '$FOO_FLAG' } } } })
+    );
+    const { sdk, calls } = makeFakeSdk({ messages: [asst('ok')] });
+    const provider = new CursorProvider({ loadSdk: async () => sdk });
+    await collect(
+      provider.sendQuery('x', dir, undefined, {
+        ...BASE_OPTS,
+        env: { CURSOR_API_KEY: 'k', FOO_FLAG: '--enabled' },
+        nodeConfig: { mcp: mcpPath, sandbox: true },
+      })
+    );
+    const opts = calls.options as {
+      mcpServers?: Record<string, { command?: string; env?: Record<string, string> }>;
+      local: { sandboxOptions?: { enabled: boolean } };
+    };
+    // The shared loader env-expands the `env` field from requestOptions.env.
+    expect(opts.mcpServers?.foo).toMatchObject({ command: 'echo', env: { FLAG: '--enabled' } });
+    expect(opts.local.sandboxOptions).toEqual({ enabled: true });
+  });
+
+  it('does not set sandboxOptions when sandbox is not requested', async () => {
+    const { sdk, calls } = makeFakeSdk({ messages: [asst('ok')] });
+    const provider = new CursorProvider({ loadSdk: async () => sdk });
+    await collect(provider.sendQuery('x', '/repo', undefined, BASE_OPTS));
+    const opts = calls.options as { mcpServers?: unknown; local: { sandboxOptions?: unknown } };
+    expect(opts.local.sandboxOptions).toBeUndefined();
+    expect(opts.mcpServers).toBeUndefined();
   });
 
   it('resumes by agentId when a resumeSessionId is given', async () => {
