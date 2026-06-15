@@ -128,7 +128,11 @@ function defaultSpawnRunner(
   const drainStderr = (async (): Promise<void> => {
     const decoder = new TextDecoder();
     for await (const chunk of proc.stderr as ReadableStream<Uint8Array>) {
-      const text = decoder.decode(chunk, { stream: true });
+      // Redact before forwarding AND before tailing: the child's stderr carries
+      // raw @cursor/sdk console/error output, which can contain bearer tokens.
+      // Best-effort per-chunk (the SDK writes whole lines, so split secrets are
+      // unlikely); the surfaced tail is redacted again at the result boundary.
+      const text = redactSecrets(decoder.decode(chunk, { stream: true }));
       process.stderr.write(text); // forward SDK noise for observability
       stderrTail = (stderrTail + text).slice(-STDERR_TAIL_MAX);
     }
@@ -341,7 +345,18 @@ export class CursorProvider implements IAgentProvider {
       'cursor.turn_started'
     );
 
-    const handle = this.spawnRunner(nodePath, runnerCfg, env);
+    let handle: CursorRunnerHandle;
+    try {
+      handle = this.spawnRunner(nodePath, runnerCfg, env);
+    } catch (err) {
+      // Bun.spawn can throw synchronously (e.g. the resolved node path is not
+      // executable). Surface it as a clean, redacted result rather than letting
+      // it escape the generator.
+      const message = err instanceof Error ? err.message : String(err);
+      log.error({ err: redactSecrets(message) }, 'cursor.turn_failed');
+      yield errorResult(`Failed to start the Cursor sidecar: ${message}`, 'cursor_error');
+      return;
+    }
     const onAbort = (): void => {
       handle.kill();
     };
@@ -399,6 +414,20 @@ export class CursorProvider implements IAgentProvider {
 
       const { exitCode, stderrTail } = await handle.exited;
 
+      // A terminal `final` is the authoritative end of the turn: if it was
+      // emitted, the run completed before/around the abort, so don't also emit an
+      // aborted result (that would yield two terminal `result` chunks).
+      if (sawFinal) {
+        log.info(
+          {
+            sessionId: state.sessionId,
+            tokens: capturedUsage ? mapToken(capturedUsage) : undefined,
+          },
+          'cursor.turn_completed'
+        );
+        return;
+      }
+
       if (abortSignal?.aborted) {
         for (const chunk of flushText(state)) yield chunk;
         yield {
@@ -409,17 +438,6 @@ export class CursorProvider implements IAgentProvider {
           stopReason: 'aborted',
         };
         log.info({ sessionId: state.sessionId }, 'cursor.turn_aborted');
-        return;
-      }
-
-      if (sawFinal) {
-        log.info(
-          {
-            sessionId: state.sessionId,
-            tokens: capturedUsage ? mapToken(capturedUsage) : undefined,
-          },
-          'cursor.turn_completed'
-        );
         return;
       }
 

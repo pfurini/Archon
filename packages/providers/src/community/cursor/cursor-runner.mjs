@@ -35,8 +35,16 @@ for (const m of ['log', 'info', 'warn', 'error', 'debug']) {
 import { Agent, SqliteLocalAgentStore } from '@cursor/sdk';
 
 /** Emit one JSONL line on stdout. `JSON.stringify` escapes embedded newlines,
- *  so very long tool-result lines remain newline-framed. */
-const emit = o => process.stdout.write(JSON.stringify(o) + '\n');
+ *  so very long tool-result lines remain newline-framed. Respects backpressure:
+ *  if the stdout pipe is full, `write()` buffers and returns false — we wait for
+ *  `'drain'` before resolving so the parent's slow reads can't make us force a
+ *  `process.exit()` with unflushed bytes (which would truncate JSONL the parent
+ *  is still consuming). Always `await` it. */
+const emit = o =>
+  new Promise(resolve => {
+    if (process.stdout.write(JSON.stringify(o) + '\n')) resolve();
+    else process.stdout.once('drain', resolve);
+  });
 
 async function readStdin() {
   const chunks = [];
@@ -68,7 +76,7 @@ try {
   const agent = cfg.resumeSessionId
     ? await Agent.resume(cfg.resumeSessionId, opts)
     : await Agent.create(opts);
-  emit({ kind: 'agent', agentId: agent.agentId });
+  await emit({ kind: 'agent', agentId: agent.agentId });
 
   // Usage is delivered ONLY via the onDelta `turn-ended` interaction update —
   // never on run.wait()'s RunResult nor any run.stream() message.
@@ -79,9 +87,9 @@ try {
     },
   });
 
-  for await (const msg of run.stream()) emit({ kind: 'msg', message: msg });
+  for await (const msg of run.stream()) await emit({ kind: 'msg', message: msg });
   const res = await run.wait();
-  emit({ kind: 'final', status: res.status, result: res.result, usage });
+  await emit({ kind: 'final', status: res.status, result: res.result, usage });
 
   try {
     agent.close();
@@ -95,7 +103,7 @@ try {
   }
   process.exit(0);
 } catch (err) {
-  emit({ kind: 'error', message: err instanceof Error ? err.message : String(err) });
+  await emit({ kind: 'error', message: err instanceof Error ? err.message : String(err) });
   try {
     await store?.dispose();
   } catch {

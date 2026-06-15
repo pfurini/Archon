@@ -337,6 +337,45 @@ describe('CursorProvider.sendQuery', () => {
     expect(result.errors?.[0]).not.toContain('sk-secret');
   });
 
+  it('does not emit a second result when abort races a final line (single terminal)', async () => {
+    const controller = new AbortController();
+    // A final line is processed; abort then fires as the child exits. The final
+    // is authoritative — only one terminal `result` must be emitted (not also an
+    // aborted one).
+    const provider = new CursorProvider({
+      resolveNodePath: () => '/fake/node',
+      spawnRunner: () => ({
+        lines: (async function* (): AsyncGenerator<string> {
+          await Promise.resolve();
+          yield JSON.stringify({ kind: 'agent', agentId: 'agent-final' });
+          yield JSON.stringify({ kind: 'final', status: 'finished' });
+          controller.abort(); // abort only AFTER the final line was consumed
+        })(),
+        kill: () => {},
+        exited: Promise.resolve({ exitCode: 0, stderrTail: '' }),
+      }),
+    });
+    const chunks = await collect(
+      provider.sendQuery('x', '/repo', undefined, { ...BASE_OPTS, abortSignal: controller.signal })
+    );
+    const results = chunks.filter(c => c.type === 'result');
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ stopReason: 'stop', sessionId: 'agent-final' });
+  });
+
+  it('yields cursor_error when spawnRunner throws synchronously', async () => {
+    const provider = new CursorProvider({
+      resolveNodePath: () => '/fake/node',
+      spawnRunner: () => {
+        throw new Error('spawn EACCES /fake/node');
+      },
+    });
+    const chunks = await collect(provider.sendQuery('x', '/repo', undefined, BASE_OPTS));
+    expect(chunks).toEqual([
+      expect.objectContaining({ type: 'result', isError: true, errorSubtype: 'cursor_error' }),
+    ]);
+  });
+
   it('yields cursor_error with the stderr tail when the sidecar dies without a final line', async () => {
     const { provider } = makeProvider({
       messages: [asst('partial work')],
