@@ -206,6 +206,29 @@ export interface CursorProviderDefaults {
    * rather than letting the SDK reject from a detached background task.
    */
   model?: string;
+  /**
+   * Fast/standard tier toggle, translated to the model's `fast` param. Archon
+   * defaults to `false` (standard tier, ~6× cheaper) when this key is ABSENT —
+   * Cursor's own server default is `fast=true` (premium). Set `true` to opt into
+   * the premium/fast tier. Key PRESENCE is the provenance signal (an explicit
+   * value fails loud if the model can't express it; the implicit default is
+   * silently omitted on a model with no `fast` param).
+   */
+  fast?: boolean;
+  /**
+   * Context-window request, translated to the model's `context` param.
+   * `'1m'`/`'max'` resolve to the model's largest available value; any other
+   * string is treated as an exact catalog literal. Unset → no `context` emitted.
+   */
+  context?: string;
+  /**
+   * Escape hatch for the fail-CLOSED cost default. When the model catalog is
+   * truly unavailable (cold cache + failed refresh) the implicit `fast=false`
+   * default can't be applied, so a run is BLOCKED rather than silently billing at
+   * premium. Set `true` to instead proceed param-less (premium tier) with a
+   * visible warning. Default `false`.
+   */
+  allowPremiumOnDegraded?: boolean;
 }
 
 /** Generic per-provider defaults bag used by config surfaces and UI. */

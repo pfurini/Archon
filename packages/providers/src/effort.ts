@@ -57,6 +57,19 @@ export const EFFORT_MAPS: Record<string, EffortMap | null> = {
   opencode: null,
 };
 
+/**
+ * Providers whose effort mapping is DRIVEN BY A LIVE PER-MODEL CATALOG rather
+ * than a static {@link EffortMap}. They legitimately advertise
+ * `effortControl: true` WITHOUT an `EFFORT_MAPS` row — the per-model clamp lives
+ * in the provider (e.g. cursor's `resolveCursorParams` validates against
+ * `Cursor.models.list()`, where the effort vocabulary varies by model:
+ * `effort` low/medium/high/xhigh/max on Claude vs `reasoning`
+ * none/low/medium/high/extra-high on GPT). The `effortControl ⇔ EFFORT_MAPS`
+ * invariant (`effort.test.ts`) EXEMPTS these — adding a misleading static row
+ * would claim a fixed vocabulary that doesn't exist.
+ */
+export const DYNAMIC_CATALOG_EFFORT_PROVIDERS = new Set<string>(['cursor']);
+
 /** True when `v` is one of the canonical Archon effort levels. */
 export function isArchonEffort(v: unknown): v is ArchonEffort {
   return typeof v === 'string' && (ARCHON_EFFORT_LEVELS as readonly string[]).includes(v);

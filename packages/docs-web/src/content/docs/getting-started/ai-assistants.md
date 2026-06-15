@@ -378,6 +378,9 @@ Cursor is **api-key only** in Phase 1 (no subscription/OAuth login).
 assistants:
   cursor:
     model: composer-2.5   # default when none is set on node/workflow/tier
+    fast: false           # billing tier (default false = standard, ~6× cheaper). true = premium.
+    context: 1m           # optional context-window request: '1m' | 'max' | a literal catalog value
+    allowPremiumOnDegraded: false  # if the catalog can't be reached, proceed at premium instead of blocking
 ```
 
 The built-in default is `composer-2.5` (Cursor-native, balanced) — a bare `provider: cursor` with no model resolves to it. List the live catalog with the SDK's `Cursor.models.list()`.
@@ -394,6 +397,25 @@ The `small` / `medium` / `large` tier keywords resolve to concrete Cursor model 
 
 Model ids are plain Cursor ids (no `[1m]` suffix — that's Claude-SDK syntax).
 
+### Model parameters & billing tier (effort / thinking / context / fast)
+
+Archon translates its canonical knobs into Cursor's per-model [`ModelSelection.params`](https://www.npmjs.com/package/@cursor/sdk), **validated against the live `Cursor.models.list()` catalog** (durably cached under `~/.archon/cursor/`):
+
+| Knob | Source | Cursor param | Notes |
+|---|---|---|---|
+| `effort` | node/workflow `effort:` (`low`/`medium`/`high`/`max`) | `effort` (Claude) **or** `reasoning` (GPT) | The id is swapped per model; `max` clamps to the model's highest rung (Claude `xhigh`/`max`, GPT `extra-high`). |
+| `thinking` | node/workflow `thinking:` | `thinking` (`true`/`false`) | `enabled`→`true`, `disabled`→`false`, **`adaptive`→`true`** (Cursor thinking is binary — a documented lossy mapping). |
+| `context` | `assistants.cursor.context` | `context` | `1m`/`max` → the model's largest window; a literal (e.g. `272k`) is used verbatim when the model supports it. |
+| `fast` | `assistants.cursor.fast` | `fast` (`true`/`false`) | **Billing tier.** See below. |
+
+**Billing default — standard tier (`fast=false`).** Cursor's own server default is `fast=true` (**premium**, ~6× pricier). Archon runs background workflows, not live IDE iteration, so it **explicitly sends `fast=false`** (standard) unless you set `assistants.cursor.fast: true`. Set `true` to opt into premium.
+
+**Minimal & fail-loud.** Only the knobs actually in play are sent — an un-set param keeps the model's own default; hidden/default-variant params are never emitted. A knob the resolved model **can't express** (e.g. `thinking` on a GPT model, or `effort` on a model without it) makes the run **fail loudly** (`cursor_model_params_unavailable`) rather than silently dropping it.
+
+**Degraded-catalog policy (fail closed, not open to premium).** If the model catalog is truly unreachable (cold cache + a failed refresh), the standard-tier default can't be validated. Rather than silently billing premium, the run is **blocked** with a visible error — unless you set `assistants.cursor.allowPremiumOnDegraded: true`, which proceeds param-less (premium tier) plus a visible warning. The catalog keeps a durable last-good snapshot, so this is rare (a first-ever run with no network).
+
+**Observability caveat.** The SDK does **not** report the server-resolved params or the billed tier — `run.wait().model` echoes the request and `system.model` is undefined for local agents. Archon controls the request shape; **confirm the billed tier once on the Cursor dashboard.**
+
 ### Supported Archon Features
 
 Phase 1 scope — flags reflect **wired** behavior (the dag-executor warns when a node uses an ignored feature):
@@ -408,8 +430,8 @@ Phase 1 scope — flags reflect **wired** behavior (the dag-executor warns when 
 | Skills | ❌ | workspace auto-load only (`.cursor/rules`, `AGENTS.md` via `settingSources: ['project']`); no per-node injection |
 | Inline agents (`agents:`) | ❌ | feasible via `AgentOptions.agents`; deferred past Phase 1 |
 | Tool restrictions | ❌ | no per-call allow/deny surface exposed |
-| Effort / reasoning control | ❌ | would need per-model `ModelSelection.params`; deferred |
-| Thinking control | ❌ | no explicit field |
+| Effort / reasoning control | ✅ | node `effort:` → the model's `effort`/`reasoning` param (catalog-validated, id-swapped, `max`-clamped). Explicit + unsupported → fail-loud. See [Model parameters](#model-parameters--billing-tier-effort--thinking--context--fast). |
+| Thinking control | ✅ | node `thinking:` → the model's `thinking` param (`enabled`/`adaptive`→`true`, `disabled`→`false`). Explicit + unsupported → fail-loud. |
 | Fallback model | ❌ | no native failover |
 | Cost limits (`maxBudgetUsd`) | ❌ | no runtime budget enforcement |
 | Native tools | ❌ | so the orchestrator appends the bash run-management prompt for project-scoped chat (same path as Codex/OpenCode/Copilot) |

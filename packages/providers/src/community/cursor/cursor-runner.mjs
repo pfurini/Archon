@@ -34,6 +34,8 @@ for (const m of ['log', 'info', 'warn', 'error', 'debug']) {
 
 import { Agent, SqliteLocalAgentStore } from '@cursor/sdk';
 
+import { buildAgentOptions } from './runner-options.mjs';
+
 /** Emit one JSONL line on stdout. `JSON.stringify` escapes embedded newlines,
  *  so very long tool-result lines remain newline-framed. Respects backpressure:
  *  if the stdout pipe is full, `write()` buffers and returns false — we wait for
@@ -61,17 +63,8 @@ try {
   // agentId persists across ephemeral worktrees.
   store = await SqliteLocalAgentStore.open({ workspaceRef: cfg.cwd, stateRoot: cfg.stateRoot });
 
-  const opts = {
-    apiKey: process.env.CURSOR_API_KEY,
-    model: { id: cfg.model },
-    local: {
-      cwd: cfg.cwd,
-      settingSources: cfg.settingSources ?? ['project'],
-      store,
-      ...(cfg.sandbox ? { sandboxOptions: { enabled: true } } : {}),
-    },
-    ...(cfg.mcpServers ? { mcpServers: cfg.mcpServers } : {}),
-  };
+  // The SAME options (incl. per-model ModelSelection.params) drive create + resume.
+  const opts = buildAgentOptions(cfg, { store, apiKey: process.env.CURSOR_API_KEY });
 
   const agent = cfg.resumeSessionId
     ? await Agent.resume(cfg.resumeSessionId, opts)

@@ -19,10 +19,20 @@ import type { ProviderCapabilities } from '../../types';
  * - `nativeTools: false` ⟹ the orchestrator appends the bash run-management
  *   prompt for project-scoped chat (same path as Codex/OpenCode/Copilot).
  *
+ * - `effortControl` / `thinkingControl`: node `effort:` / `thinking:` translate to
+ *   the resolved model's `ModelSelection.params` (`effort`/`reasoning` and
+ *   `thinking`), VALIDATED against the live `Cursor.models.list()` catalog. An
+ *   EXPLICIT knob the model can't express fails LOUD (`cursor_model_params_unavailable`,
+ *   sidecar not spawned) — never silently dropped, so advertising `true` is honest
+ *   (see `model-params.ts` / `provider.ts`). cursor's effort vocabulary is
+ *   per-model (catalog-driven), so it is NOT in the static `EFFORT_MAPS` table but
+ *   in `DYNAMIC_CATALOG_EFFORT_PROVIDERS` (the invariant's exemption — `effort.ts`).
+ *
  * Deferred (feasible via the SDK, not in Phase 1): inline `agents`
- * (`AgentOptions.agents`), `effortControl` (per-model `ModelSelection.params`),
- * `nativeTools` (an `SDKCustomTool` host for `manage_run`). `envInjection` is
- * `false` because local Cursor agents take no env map (only cloud agents do).
+ * (`AgentOptions.agents`), `nativeTools` (an `SDKCustomTool` host for `manage_run`).
+ * `envInjection` is `false` because local Cursor agents take no env map (only cloud
+ * agents do). `costControl` (`maxBudgetUsd`) is unsupported; the cost lever is the
+ * `fast`/standard tier via `assistants.cursor.fast`.
  */
 export const CURSOR_CAPABILITIES: ProviderCapabilities = {
   sessionResume: true,
@@ -34,8 +44,8 @@ export const CURSOR_CAPABILITIES: ProviderCapabilities = {
   structuredOutput: 'best-effort', // prompt-augmented + JSON extraction (no SDK grammar enforcement)
   envInjection: false,
   costControl: false,
-  effortControl: false,
-  thinkingControl: false,
+  effortControl: true, // node effort: → ModelSelection.params (catalog-validated, fail-loud)
+  thinkingControl: true, // node thinking: → ModelSelection.params.thinking (catalog-validated)
   fallbackModel: false,
   sandbox: true,
   nativeTools: false,

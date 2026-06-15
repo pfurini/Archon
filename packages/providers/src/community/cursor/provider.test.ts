@@ -6,13 +6,80 @@ import { describe, expect, it } from 'bun:test';
 
 import type { MessageChunk, SendQueryOptions } from '../../types';
 
+import type { CursorCatalog } from './catalog';
 import {
   CursorProvider,
+  type CursorCatalogLoader,
   type CursorProviderDeps,
   type CursorRunnerConfig,
   type CursorRunnerHandle,
 } from './provider';
-import type { CursorUsage, RunResult, SDKMessage } from './sdk-types';
+import type { CursorUsage, ModelListItem, RunResult, SDKMessage } from './sdk-types';
+
+// ─── Fake model catalog (loadCatalog seam) ───────────────────────────────────
+//
+// The provider resolves per-model params against the live catalog. These tests
+// inject a fake `loadCatalog` so no `node` helper is spawned. The default
+// catalog lists the models the suite uses, each with a `fast` param so the
+// implicit `fast=false` cost default resolves cleanly.
+const CATALOG_MODELS: ModelListItem[] = [
+  {
+    id: 'composer-1',
+    displayName: 'Composer 1',
+    parameters: [{ id: 'fast', values: [{ value: 'false' }, { value: 'true' }] }],
+  },
+  {
+    id: 'composer-2.5',
+    displayName: 'Composer 2.5',
+    parameters: [{ id: 'fast', values: [{ value: 'false' }, { value: 'true' }] }],
+  },
+  {
+    id: 'gpt-5.4',
+    displayName: 'GPT-5.4',
+    parameters: [
+      {
+        id: 'reasoning',
+        values: [{ value: 'low' }, { value: 'medium' }, { value: 'high' }, { value: 'extra-high' }],
+      },
+      { id: 'fast', values: [{ value: 'false' }, { value: 'true' }] },
+    ],
+  },
+  { id: 'gemini-3-flash', displayName: 'Gemini 3 Flash', parameters: [] },
+];
+
+interface FakeCatalogConfig {
+  models?: ModelListItem[];
+  /** Simulate a degraded (cold + failed refresh) catalog. */
+  unavailable?: boolean;
+  /** Served from a (stale) disk snapshot — enables the param-rejection retry. */
+  servedFromDisk?: boolean;
+  /** Models the catalog flips to after a successful forceRefresh. */
+  refreshedModels?: ModelListItem[];
+  /** Make forceRefresh reject (simulate persistent network failure). */
+  refreshFails?: boolean;
+}
+
+function makeFakeCatalog(c: FakeCatalogConfig): {
+  catalog: CursorCatalog;
+  forceRefreshes: () => number;
+} {
+  let refreshes = 0;
+  const catalog: CursorCatalog = {
+    models: c.unavailable ? [] : (c.models ?? CATALOG_MODELS),
+    fetchedAt: c.unavailable ? undefined : 1,
+    ageMs: c.unavailable ? undefined : 0,
+    servedFromDisk: c.servedFromDisk ?? false,
+    available: c.unavailable ? false : true,
+    forceRefresh: async (): Promise<void> => {
+      refreshes++;
+      if (c.refreshFails) throw new Error('catalog refresh failed');
+      catalog.models = c.refreshedModels ?? catalog.models;
+      catalog.servedFromDisk = false;
+      catalog.available = catalog.models.length > 0;
+    },
+  };
+  return { catalog, forceRefreshes: () => refreshes };
+}
 
 // ─── Fake Node sidecar (runner-spawn seam) ───────────────────────────────────
 //
@@ -95,10 +162,28 @@ function makeFakeRunner(cfgR: FakeRunnerConfig): {
 }
 
 /** Build a provider whose `node` resolves and whose sidecar is the fake runner. */
-function makeProvider(cfgR: FakeRunnerConfig): { provider: CursorProvider; calls: FakeCalls } {
+function makeProvider(
+  cfgR: FakeRunnerConfig,
+  catalogCfg: FakeCatalogConfig = {}
+): {
+  provider: CursorProvider;
+  calls: FakeCalls;
+  forceRefreshes: () => number;
+  loadCount: () => number;
+} {
   const { spawnRunner, calls } = makeFakeRunner(cfgR);
-  const provider = new CursorProvider({ resolveNodePath: () => '/fake/node', spawnRunner });
-  return { provider, calls };
+  const { catalog, forceRefreshes } = makeFakeCatalog(catalogCfg);
+  let loads = 0;
+  const loadCatalog: CursorCatalogLoader = async () => {
+    loads++;
+    return catalog;
+  };
+  const provider = new CursorProvider({
+    resolveNodePath: () => '/fake/node',
+    spawnRunner,
+    loadCatalog,
+  });
+  return { provider, calls, forceRefreshes, loadCount: () => loads };
 }
 
 // ─── Message builders ────────────────────────────────────────────────────────
@@ -134,6 +219,9 @@ async function collect(gen: AsyncGenerator<MessageChunk>): Promise<MessageChunk[
 }
 
 const BASE_OPTS: SendQueryOptions = { model: 'composer-1', env: { CURSOR_API_KEY: 'test-key' } };
+
+/** A loader returning an available catalog — for tests that construct the provider directly. */
+const okCatalogLoader: CursorCatalogLoader = async () => makeFakeCatalog({}).catalog;
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
@@ -344,6 +432,7 @@ describe('CursorProvider.sendQuery', () => {
     // aborted one).
     const provider = new CursorProvider({
       resolveNodePath: () => '/fake/node',
+      loadCatalog: okCatalogLoader,
       spawnRunner: () => ({
         lines: (async function* (): AsyncGenerator<string> {
           await Promise.resolve();
@@ -366,6 +455,7 @@ describe('CursorProvider.sendQuery', () => {
   it('yields cursor_error when spawnRunner throws synchronously', async () => {
     const provider = new CursorProvider({
       resolveNodePath: () => '/fake/node',
+      loadCatalog: okCatalogLoader,
       spawnRunner: () => {
         throw new Error('spawn EACCES /fake/node');
       },
@@ -393,5 +483,250 @@ describe('CursorProvider.sendQuery', () => {
     expect(result.isError).toBe(true);
     expect(result.errorSubtype).toBe('cursor_error');
     expect(result.errors?.[0]).toContain('Cannot find module');
+  });
+});
+
+// ─── Per-model parameters (Phase 1) ──────────────────────────────────────────
+
+function result(chunks: MessageChunk[]): Extract<MessageChunk, { type: 'result' }> | undefined {
+  return chunks.find(c => c.type === 'result') as
+    | Extract<MessageChunk, { type: 'result' }>
+    | undefined;
+}
+
+describe('CursorProvider.sendQuery — model parameters', () => {
+  it('translates node effort to the model reasoning/effort param (cfg.modelParams)', async () => {
+    const { provider, calls } = makeProvider({ messages: [asst('ok')] });
+    await collect(
+      provider.sendQuery('x', '/repo', undefined, {
+        ...BASE_OPTS,
+        model: 'gpt-5.4',
+        nodeConfig: { effort: 'high' },
+      })
+    );
+    expect(calls.cfg?.modelParams).toContainEqual({ id: 'reasoning', value: 'high' });
+  });
+
+  it('emits the implicit standard-tier default (fast=false) when no knobs are set', async () => {
+    const { provider, calls } = makeProvider({ messages: [asst('ok')] });
+    await collect(provider.sendQuery('x', '/repo', undefined, BASE_OPTS));
+    expect(calls.cfg?.modelParams).toEqual([{ id: 'fast', value: 'false' }]);
+  });
+
+  it('honors an explicit config fast=false', async () => {
+    const { provider, calls } = makeProvider({ messages: [asst('ok')] });
+    await collect(
+      provider.sendQuery('x', '/repo', undefined, {
+        ...BASE_OPTS,
+        assistantConfig: { fast: false },
+      })
+    );
+    expect(calls.cfg?.modelParams).toEqual([{ id: 'fast', value: 'false' }]);
+  });
+
+  it('honors an explicit config fast=true (opt into premium)', async () => {
+    const { provider, calls } = makeProvider({ messages: [asst('ok')] });
+    await collect(
+      provider.sendQuery('x', '/repo', undefined, { ...BASE_OPTS, assistantConfig: { fast: true } })
+    );
+    expect(calls.cfg?.modelParams).toEqual([{ id: 'fast', value: 'true' }]);
+  });
+
+  it('fails closed (cursor_model_params_unavailable, no spawn) on an explicit knob the catalog can not honor', async () => {
+    // Catalog is available but does NOT list composer-1; an explicit effort knob
+    // therefore can't be validated → fail-loud.
+    const { provider, calls } = makeProvider(
+      { messages: [asst('ok')] },
+      { models: [{ id: 'other-model', displayName: 'Other', parameters: [] }] }
+    );
+    const chunks = await collect(
+      provider.sendQuery('x', '/repo', undefined, { ...BASE_OPTS, nodeConfig: { effort: 'high' } })
+    );
+    expect(result(chunks)?.errorSubtype).toBe('cursor_model_params_unavailable');
+    expect(calls.cfg).toBeUndefined(); // sidecar NOT spawned
+  });
+
+  it('fails closed when the catalog is DOWN and only the implicit cost default is in play', async () => {
+    const { provider, calls } = makeProvider({ messages: [asst('ok')] }, { unavailable: true });
+    const chunks = await collect(provider.sendQuery('x', '/repo', undefined, BASE_OPTS));
+    expect(result(chunks)?.errorSubtype).toBe('cursor_model_params_unavailable');
+    expect(calls.cfg).toBeUndefined();
+  });
+
+  it('with allowPremiumOnDegraded proceeds param-less + a visible system warning when the catalog is DOWN', async () => {
+    const { provider, calls } = makeProvider({ messages: [asst('ok')] }, { unavailable: true });
+    const chunks = await collect(
+      provider.sendQuery('x', '/repo', undefined, {
+        ...BASE_OPTS,
+        assistantConfig: { allowPremiumOnDegraded: true },
+      })
+    );
+    expect(result(chunks)?.isError).toBeFalsy();
+    // Visible (system) premium warning + sidecar spawned param-less.
+    const sys = chunks.find(c => c.type === 'system') as Extract<MessageChunk, { type: 'system' }>;
+    expect(sys?.content).toMatch(/premium/i);
+    expect(calls.cfg).toBeDefined();
+    expect(calls.cfg?.modelParams).toBeUndefined();
+  });
+
+  it('explicit fast=false ALSO fails closed when the catalog is DOWN (provenance split vs implicit)', async () => {
+    const { provider, calls } = makeProvider({ messages: [asst('ok')] }, { unavailable: true });
+    const chunks = await collect(
+      provider.sendQuery('x', '/repo', undefined, {
+        ...BASE_OPTS,
+        assistantConfig: { fast: false },
+      })
+    );
+    expect(result(chunks)?.errorSubtype).toBe('cursor_model_params_unavailable');
+    expect(calls.cfg).toBeUndefined();
+  });
+
+  it('mixed explicit effort + implicit fast with a DOWN catalog fails on the EXPLICIT effort', async () => {
+    const { provider, calls } = makeProvider({ messages: [asst('ok')] }, { unavailable: true });
+    const chunks = await collect(
+      provider.sendQuery('x', '/repo', undefined, { ...BASE_OPTS, nodeConfig: { effort: 'high' } })
+    );
+    // Fails (no spawn). The explicit effort is the trigger — an unknown model with
+    // an explicit knob throws CursorModelParamsError before the cost-default gate.
+    expect(result(chunks)?.errorSubtype).toBe('cursor_model_params_unavailable');
+    expect(calls.cfg).toBeUndefined();
+  });
+
+  it('rejects a present-but-invalid config value with cursor_config_invalid', async () => {
+    const { provider, calls } = makeProvider({ messages: [asst('ok')] });
+    const chunks = await collect(
+      provider.sendQuery('x', '/repo', undefined, {
+        ...BASE_OPTS,
+        assistantConfig: { fast: 'yes' },
+      })
+    );
+    expect(result(chunks)?.errorSubtype).toBe('cursor_config_invalid');
+    expect(calls.cfg).toBeUndefined();
+  });
+
+  it('fails before spawn on an explicit thinking knob the model can not express', async () => {
+    // gpt-5.4 has reasoning + fast but NO thinking param.
+    const { provider, calls } = makeProvider({ messages: [asst('ok')] });
+    const chunks = await collect(
+      provider.sendQuery('x', '/repo', undefined, {
+        ...BASE_OPTS,
+        model: 'gpt-5.4',
+        nodeConfig: { thinking: { type: 'enabled' } },
+      })
+    );
+    expect(result(chunks)?.errorSubtype).toBe('cursor_model_params_unavailable');
+    expect(calls.cfg).toBeUndefined(); // sidecar NOT spawned (compensates the removed DAG warning)
+  });
+
+  it('carries model params on the resume path', async () => {
+    const { provider, calls } = makeProvider({ messages: [asst('resumed')] });
+    await collect(
+      provider.sendQuery('again', '/repo', 'agent-prev', {
+        ...BASE_OPTS,
+        model: 'gpt-5.4',
+        nodeConfig: { effort: 'high' },
+      })
+    );
+    expect(calls.cfg?.resumeSessionId).toBe('agent-prev');
+    expect(calls.cfg?.modelParams).toContainEqual({ id: 'reasoning', value: 'high' });
+  });
+
+  it('forwards CHANGED knobs on a persist_session re-run (resume) request-shape', async () => {
+    // A persist_session re-run resumes the prior agent with possibly different
+    // knobs. The new REQUEST shape is forwarded; whether a resumed agent actually
+    // re-applies changed params server-side is UNOBSERVABLE via the SDK (§0.3).
+    const { provider, calls } = makeProvider({ messages: [asst('ok')] });
+    await collect(
+      provider.sendQuery('again', '/repo', 'agent-prev', {
+        ...BASE_OPTS,
+        model: 'gpt-5.4',
+        nodeConfig: { effort: 'low' },
+      })
+    );
+    expect(calls.cfg?.modelParams).toContainEqual({ id: 'reasoning', value: 'low' });
+  });
+
+  describe('param-rejection retry (stale catalog drift)', () => {
+    /** A spawnRunner that emits a param-rejection error on the FIRST spawn, then
+     *  scripted lines on subsequent spawns. Tracks spawn count + last cfg. */
+    function makeRetryRunner(secondAttempt: { errorLine?: string }): {
+      spawnRunner: NonNullable<CursorProviderDeps['spawnRunner']>;
+      spawns: () => number;
+      lastModelParams: () => unknown;
+    } {
+      let spawns = 0;
+      let lastModelParams: unknown;
+      const spawnRunner: NonNullable<CursorProviderDeps['spawnRunner']> = (
+        _node,
+        cfg
+      ): CursorRunnerHandle => {
+        spawns++;
+        lastModelParams = cfg.modelParams;
+        const isFirst = spawns === 1;
+        async function* lines(): AsyncGenerator<string> {
+          await Promise.resolve();
+          if (isFirst) {
+            // Create-time param rejection — no agent/content emitted first.
+            yield JSON.stringify({ kind: 'error', message: 'invalid parameter value for model' });
+            return;
+          }
+          if (secondAttempt.errorLine !== undefined) {
+            yield JSON.stringify({ kind: 'error', message: secondAttempt.errorLine });
+            return;
+          }
+          yield JSON.stringify({ kind: 'agent', agentId: 'agent-retry' });
+          yield JSON.stringify({ kind: 'msg', message: asst('recovered') });
+          yield JSON.stringify({ kind: 'final', status: 'finished' });
+        }
+        return {
+          lines: lines(),
+          kill: () => {},
+          exited: Promise.resolve({ exitCode: isFirst ? 1 : 0, stderrTail: '' }),
+        };
+      };
+      return { spawnRunner, spawns: () => spawns, lastModelParams: () => lastModelParams };
+    }
+
+    it('invalidates + refreshes + retries ONCE on a create-time param rejection, then succeeds', async () => {
+      const { spawnRunner, spawns } = makeRetryRunner({});
+      const { catalog, forceRefreshes } = makeFakeCatalog({ servedFromDisk: true });
+      const provider = new CursorProvider({
+        resolveNodePath: () => '/fake/node',
+        spawnRunner,
+        loadCatalog: async () => catalog,
+      });
+      const chunks = await collect(provider.sendQuery('x', '/repo', undefined, BASE_OPTS));
+      expect(forceRefreshes()).toBe(1); // exactly one refresh
+      expect(spawns()).toBe(2); // original + one retry
+      expect(chunks.find(c => c.type === 'assistant')).toMatchObject({ content: 'recovered' });
+    });
+
+    it('fails after the retry also errors (no infinite loop)', async () => {
+      const { spawnRunner, spawns } = makeRetryRunner({ errorLine: 'still invalid parameter' });
+      const { catalog, forceRefreshes } = makeFakeCatalog({ servedFromDisk: true });
+      const provider = new CursorProvider({
+        resolveNodePath: () => '/fake/node',
+        spawnRunner,
+        loadCatalog: async () => catalog,
+      });
+      const chunks = await collect(provider.sendQuery('x', '/repo', undefined, BASE_OPTS));
+      expect(forceRefreshes()).toBe(1);
+      expect(spawns()).toBe(2); // exactly one retry, then give up
+      expect(result(chunks)?.isError).toBe(true);
+    });
+
+    it('does NOT retry when the catalog was network-fresh (not served from disk)', async () => {
+      const { spawnRunner, spawns } = makeRetryRunner({});
+      const { catalog, forceRefreshes } = makeFakeCatalog({ servedFromDisk: false });
+      const provider = new CursorProvider({
+        resolveNodePath: () => '/fake/node',
+        spawnRunner,
+        loadCatalog: async () => catalog,
+      });
+      const chunks = await collect(provider.sendQuery('x', '/repo', undefined, BASE_OPTS));
+      expect(forceRefreshes()).toBe(0);
+      expect(spawns()).toBe(1); // the create-time error surfaces, no retry
+      expect(result(chunks)?.isError).toBe(true);
+    });
   });
 });

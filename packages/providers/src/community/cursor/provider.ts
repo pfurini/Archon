@@ -46,9 +46,23 @@ import {
 } from '../../shared/structured-output';
 
 import { CURSOR_CAPABILITIES } from './capabilities';
-import { DEFAULT_CURSOR_MODEL, parseCursorConfig } from './config';
+import { type CursorCatalog, loadCursorCatalog } from './catalog';
+import { CursorConfigError, DEFAULT_CURSOR_MODEL, parseCursorConfig } from './config';
+import {
+  CursorModelParamsError,
+  type CursorKnobs,
+  type CursorThinkingInput,
+  isCursorParamRejection,
+  resolveCursorParams,
+} from './model-params';
 import { redactSecrets } from './redact';
-import type { CursorUsage, McpServerConfig, RunResult, SDKMessage } from './sdk-types';
+import type {
+  CursorUsage,
+  McpServerConfig,
+  ModelParameterValue,
+  RunResult,
+  SDKMessage,
+} from './sdk-types';
 import {
   finalizeResult,
   flushText,
@@ -73,6 +87,12 @@ export interface CursorRunnerConfig {
   settingSources: string[];
   mcpServers?: Record<string, McpServerConfig>;
   sandbox?: boolean;
+  /**
+   * Per-model Cursor `ModelSelection.params` (effort/thinking/context/fast).
+   * Minimal — only the knobs in play (plan §3). Omitted when no knob applies, so
+   * the runner sends `model: { id }` (byte-for-byte the pre-feature shape).
+   */
+  modelParams?: ModelParameterValue[];
 }
 
 /** One JSONL line emitted by the sidecar on stdout. */
@@ -189,6 +209,13 @@ function errorResult(message: string, subtype: string): MessageChunk {
   return { type: 'result', isError: true, errorSubtype: subtype, errors: [redactSecrets(message)] };
 }
 
+/** Load the Cursor model catalog. Default: {@link loadCursorCatalog}. */
+export type CursorCatalogLoader = (opts: {
+  stateRoot: string;
+  apiKey: string;
+  nodePath: string;
+}) => Promise<CursorCatalog>;
+
 /** Injectable seams for testing the pump without a real `node` / `@cursor/sdk`. */
 export interface CursorProviderDeps {
   /** Resolve the `node` binary path (null → fail fast). Default: `Bun.which('node')`. */
@@ -199,6 +226,8 @@ export interface CursorProviderDeps {
     cfg: CursorRunnerConfig,
     env: Record<string, string | undefined>
   ) => CursorRunnerHandle;
+  /** Load the model catalog. Default: {@link loadCursorCatalog} (spawns node helper). */
+  loadCatalog?: CursorCatalogLoader;
 }
 
 export class CursorProvider implements IAgentProvider {
@@ -208,10 +237,15 @@ export class CursorProvider implements IAgentProvider {
     cfg: CursorRunnerConfig,
     env: Record<string, string | undefined>
   ) => CursorRunnerHandle;
+  private readonly loadCatalog: CursorCatalogLoader;
 
   constructor(deps: CursorProviderDeps = {}) {
     this.resolveNodePath = deps.resolveNodePath ?? ((): string | null => Bun.which('node'));
     this.spawnRunner = deps.spawnRunner ?? defaultSpawnRunner;
+    this.loadCatalog =
+      deps.loadCatalog ??
+      (({ stateRoot, apiKey, nodePath }): Promise<CursorCatalog> =>
+        loadCursorCatalog({ stateRoot, apiKey, nodePath }));
   }
 
   getType(): string {
@@ -230,7 +264,19 @@ export class CursorProvider implements IAgentProvider {
   ): AsyncGenerator<MessageChunk> {
     const log = getLog();
 
-    const cfg = parseCursorConfig(requestOptions?.assistantConfig ?? {});
+    let cfg;
+    try {
+      cfg = parseCursorConfig(requestOptions?.assistantConfig ?? {});
+    } catch (err) {
+      // A present-but-invalid assistants.cursor.* value (e.g. `fast: "yes"`) is
+      // surfaced, never silently dropped — a silent drop could invert the cost
+      // default. Fail-loud (plan §3).
+      if (err instanceof CursorConfigError) {
+        yield errorResult(err.message, 'cursor_config_invalid');
+        return;
+      }
+      throw err;
+    }
     // tier/alias already resolved upstream into requestOptions.model; fall back
     // to the config default, then the built-in default (local Cursor agents
     // require a concrete model).
@@ -310,7 +356,68 @@ export class CursorProvider implements IAgentProvider {
     // file-locking — resume routes by agentId through it, not via the cwd.
     const stateRoot = join(getArchonHome(), 'cursor', 'store');
 
-    const runnerCfg: CursorRunnerConfig = {
+    // ── Per-model parameters (effort / thinking / context / fast) ──────────────
+    // Knob provenance = PRESENCE in its source. effort/thinking are explicit iff
+    // present in nodeConfig (the executor flattens node/workflow values there).
+    // fast/context are explicit iff the key is present in config; `fast` defaults
+    // to the IMPLICIT cost default `false` (standard tier, ~6× cheaper) — Cursor's
+    // own server default is `fast=true` (premium), so we set it explicitly.
+    const knobs: CursorKnobs = {};
+    if (nodeConfig?.effort !== undefined)
+      knobs.effort = { value: nodeConfig.effort, explicit: true };
+    if (nodeConfig?.thinking !== undefined)
+      knobs.thinking = { value: nodeConfig.thinking as CursorThinkingInput, explicit: true };
+    if (typeof cfg.context === 'string') knobs.context = { value: cfg.context, explicit: true };
+    // parseCursorConfig only ever sets `fast` to a boolean (or throws), so a
+    // boolean value IS the presence/explicit signal; absent ⇒ the implicit default.
+    knobs.fast =
+      typeof cfg.fast === 'boolean'
+        ? { value: cfg.fast, explicit: true }
+        : { value: false, explicit: false };
+
+    // Load the durable model catalog (zero blocking network when a snapshot
+    // exists) and translate the knobs into a MINIMAL, validated param list.
+    const catalog = await this.loadCatalog({
+      stateRoot: join(getArchonHome(), 'cursor'),
+      apiKey,
+      nodePath,
+    });
+
+    let modelParams: ModelParameterValue[];
+    try {
+      const resolved = resolveCursorParams(catalog.models, model, knobs);
+      // Cost-default fail-CLOSED: if the model can't be verified against the
+      // catalog, the implicit `fast=false` default can't be applied — proceeding
+      // param-less makes the server bill at the premium (fast) tier. Block unless
+      // the user opted into premium-on-degraded (plan §3 degraded policy).
+      if (!resolved.modelFound) {
+        if (!cfg.allowPremiumOnDegraded) {
+          log.warn({ model }, 'cursor.cost_default_unavailable');
+          yield errorResult(
+            `Cannot apply the standard-tier (fast=false) default for '${model}': the Cursor model catalog is unavailable (or does not list this model), so the run would bill at the premium (fast) tier. Restore catalog access, or set assistants.cursor.allowPremiumOnDegraded: true to proceed at premium tier.`,
+            'cursor_model_params_unavailable'
+          );
+          return;
+        }
+        yield {
+          type: 'system',
+          content:
+            'Cursor model catalog unavailable — proceeding without the standard-tier (fast=false) default. This run may bill at the premium (fast) tier.',
+        };
+      }
+      modelParams = resolved.params;
+    } catch (err) {
+      // An EXPLICIT knob the resolved model can't express → fail-loud, sidecar
+      // NOT spawned (plan §3 / finding 1).
+      if (err instanceof CursorModelParamsError) {
+        log.warn({ model, err: err.message }, 'cursor.model_params_unavailable');
+        yield errorResult(err.message, 'cursor_model_params_unavailable');
+        return;
+      }
+      throw err;
+    }
+
+    let runnerCfg: CursorRunnerConfig = {
       prompt: effectivePrompt,
       cwd,
       model,
@@ -322,6 +429,7 @@ export class CursorProvider implements IAgentProvider {
       settingSources: ['project'],
       ...(mcpServers ? { mcpServers } : {}),
       ...(sandboxEnabled ? { sandbox: true } : {}),
+      ...(modelParams.length > 0 ? { modelParams } : {}),
     };
     // CURSOR_API_KEY passed inline to the child env — never bound to a logged var.
     const env: Record<string, string | undefined> = {
@@ -330,7 +438,6 @@ export class CursorProvider implements IAgentProvider {
       CURSOR_API_KEY: apiKey,
     };
 
-    const state = makeTranslationState();
     const abortSignal = requestOptions?.abortSignal;
 
     log.info(
@@ -341,9 +448,74 @@ export class CursorProvider implements IAgentProvider {
         hasOutputSchema: Boolean(outputSchema),
         mcp: Boolean(mcpServers),
         sandbox: sandboxEnabled,
+        modelParams: runnerCfg.modelParams,
       },
       'cursor.turn_started'
     );
+
+    // Run the sidecar. A create-time PARAM rejection from a (possibly stale) disk
+    // snapshot triggers a single invalidate + refresh + retry before failing
+    // (plan §4 / finding 5). Any other error is yielded as-is.
+    for (let attempt = 0; ; attempt++) {
+      const allowParamRejectionRetry =
+        attempt === 0 && catalog.servedFromDisk && (runnerCfg.modelParams?.length ?? 0) > 0;
+      try {
+        yield* this.pumpRunner(nodePath, runnerCfg, env, {
+          abortSignal,
+          outputSchema,
+          log,
+          allowParamRejectionRetry,
+        });
+        return;
+      } catch (err) {
+        if (!(err instanceof ParamRejectionRetrySignal) || attempt > 0) throw err;
+        log.warn({ model, detail: redactSecrets(err.detail) }, 'cursor.param_rejection_retry');
+        try {
+          await catalog.forceRefresh();
+        } catch {
+          yield errorResult(
+            `Cursor rejected a model parameter and refreshing the model catalog failed: ${err.detail}`,
+            'cursor_model_params_unavailable'
+          );
+          return;
+        }
+        try {
+          const re = resolveCursorParams(catalog.models, model, knobs);
+          runnerCfg = { ...runnerCfg, modelParams: re.params };
+        } catch (re) {
+          if (re instanceof CursorModelParamsError) {
+            yield errorResult(re.message, 'cursor_model_params_unavailable');
+            return;
+          }
+          throw re;
+        }
+        // loop: retry once with the refreshed params
+      }
+    }
+  }
+
+  /**
+   * Spawn the sidecar and pump one attempt's JSONL stdout into Archon chunks.
+   *
+   * When `allowParamRejectionRetry` is set, a CREATE-TIME error (one that arrives
+   * before any `agent`/content chunk) whose message looks like a parameter
+   * rejection is NOT yielded — instead a {@link ParamRejectionRetrySignal} is
+   * thrown so `sendQuery` can refresh the catalog and retry once. On the retry
+   * pass the flag is false, so any error surfaces normally.
+   */
+  private async *pumpRunner(
+    nodePath: string,
+    runnerCfg: CursorRunnerConfig,
+    env: Record<string, string | undefined>,
+    opts: {
+      abortSignal?: AbortSignal;
+      outputSchema?: Record<string, unknown>;
+      log: ReturnType<typeof createLogger>;
+      allowParamRejectionRetry: boolean;
+    }
+  ): AsyncGenerator<MessageChunk> {
+    const { abortSignal, outputSchema, log } = opts;
+    const state = makeTranslationState();
 
     let handle: CursorRunnerHandle;
     try {
@@ -366,6 +538,8 @@ export class CursorProvider implements IAgentProvider {
     }
 
     let sawFinal = false;
+    let sawAgent = false;
+    let yieldedContent = false;
     let capturedUsage: CursorUsage | undefined;
     let errorMessage: string | undefined;
 
@@ -380,10 +554,14 @@ export class CursorProvider implements IAgentProvider {
         }
         switch (parsed.kind) {
           case 'agent':
+            sawAgent = true;
             state.sessionId = parsed.agentId;
             break;
           case 'msg':
-            for (const chunk of translateSdkMessage(parsed.message, state)) yield chunk;
+            for (const chunk of translateSdkMessage(parsed.message, state)) {
+              yieldedContent = true;
+              yield chunk;
+            }
             break;
           case 'final': {
             sawFinal = true;
@@ -442,17 +620,42 @@ export class CursorProvider implements IAgentProvider {
       }
 
       // No terminal `final` line — the sidecar threw (`kind:error`) or died.
-      // Flush any buffered text before the error so partial output isn't lost.
-      for (const chunk of flushText(state)) yield chunk;
       const detail =
         errorMessage ??
         (stderrTail.trim() || `Cursor sidecar exited with code ${exitCode} before completing`);
+
+      // A create-time param rejection (error before any agent/content) from a
+      // stale catalog is recoverable: signal the caller to refresh + retry once
+      // rather than yielding the error. Nothing user-visible has been emitted yet.
+      if (
+        opts.allowParamRejectionRetry &&
+        !sawAgent &&
+        !yieldedContent &&
+        isCursorParamRejection(detail)
+      ) {
+        throw new ParamRejectionRetrySignal(detail);
+      }
+
+      // Flush any buffered text before the error so partial output isn't lost.
+      for (const chunk of flushText(state)) yield chunk;
       log.error({ err: redactSecrets(detail), exitCode }, 'cursor.turn_failed');
       yield errorResult(detail, 'cursor_error');
     } finally {
       if (abortSignal) abortSignal.removeEventListener('abort', onAbort);
       handle.kill(); // best-effort: ensure the child is dead
     }
+  }
+}
+
+/**
+ * Internal control-flow signal: a recoverable create-time parameter rejection
+ * from a stale catalog. Caught by `sendQuery` to drive the refresh + retry-once
+ * path; never escapes the provider.
+ */
+class ParamRejectionRetrySignal extends Error {
+  constructor(public readonly detail: string) {
+    super('cursor: recoverable model-parameter rejection');
+    this.name = 'ParamRejectionRetrySignal';
   }
 }
 

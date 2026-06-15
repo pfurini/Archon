@@ -8,9 +8,24 @@
  * `translateSdkMessage` / `finalizeResult` can type the raw `SDKMessage`s the
  * sidecar forwards as JSONL.
  */
-import type { SDKMessage, RunResult, McpServerConfig, TurnEndedUpdate } from '@cursor/sdk';
+import type {
+  SDKMessage,
+  RunResult,
+  McpServerConfig,
+  TurnEndedUpdate,
+  ModelListItem,
+  ModelParameterDefinition,
+  ModelParameterValue,
+} from '@cursor/sdk';
 
-export type { SDKMessage, RunResult, McpServerConfig };
+export type {
+  SDKMessage,
+  RunResult,
+  McpServerConfig,
+  ModelListItem,
+  ModelParameterDefinition,
+  ModelParameterValue,
+};
 
 /**
  * The turn-ended token-usage block. This is the SOLE usage channel the SDK
