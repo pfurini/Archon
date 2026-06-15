@@ -17,6 +17,10 @@ describe('session-transitions', () => {
       expect(shouldCreateNewSession('first-message')).toBe(false);
     });
 
+    test('returns true for provider-changed (mint a fresh session for the new provider)', () => {
+      expect(shouldCreateNewSession('provider-changed')).toBe(true);
+    });
+
     test('returns false for deactivate-only triggers', () => {
       const deactivateOnly: TransitionTrigger[] = [
         'isolation-changed',

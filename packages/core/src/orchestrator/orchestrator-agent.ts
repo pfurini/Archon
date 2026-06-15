@@ -1188,14 +1188,8 @@ export async function handleMessage(
       cwd = await ensureArchonWorkspacesPath();
     }
 
-    // 4. Update activity and get/create session
+    // 4. Update activity (session is resolved AFTER the provider below).
     await db.touchConversation(conversation.id);
-    let session = await sessionDb.getActiveSession(conversation.id);
-    if (!session) {
-      session = await sessionDb.transitionSession(conversation.id, 'first-message', {
-        ai_assistant_type: conversation.ai_assistant_type,
-      });
-    }
 
     // Reuse the config already loaded during workflow discovery (avoids a second disk read).
     // Fall back to loadConfig only when no codebase is scoped (discoveredConfig is undefined).
@@ -1282,6 +1276,32 @@ export async function handleMessage(
       }
     }
     const providerKey = chatRequest.provider;
+
+    // Get/create the active session AFTER the provider is resolved, so the
+    // session's ai_assistant_type always names the provider that mints (and
+    // owns) its assistant_session_id. A provider-specific session id is only
+    // resumable by the provider that created it — handing it to a different
+    // provider makes that provider --resume a session it never created (e.g.
+    // claude-terminal hangs on the "Resume session" picker). The resolved
+    // provider can now diverge from the conversation default via the user's
+    // default assistant or a cross-provider tier/alias, so on a provider change
+    // we transition to a fresh session bound to the new provider instead of
+    // threading the prior provider's session id forward.
+    let session = await sessionDb.getActiveSession(conversation.id);
+    if (!session) {
+      session = await sessionDb.transitionSession(conversation.id, 'first-message', {
+        ai_assistant_type: providerKey,
+      });
+    } else if (session.ai_assistant_type !== providerKey) {
+      getLog().info(
+        { conversationId, fromProvider: session.ai_assistant_type, toProvider: providerKey },
+        'session.provider_changed_reset'
+      );
+      session = await sessionDb.transitionSession(conversation.id, 'provider-changed', {
+        ai_assistant_type: providerKey,
+      });
+    }
+
     let dbEnvVars: Record<string, string> = {};
     if (conversation.codebase_id) {
       try {
