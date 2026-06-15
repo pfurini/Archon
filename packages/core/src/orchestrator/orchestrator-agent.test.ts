@@ -2640,6 +2640,39 @@ describe('handleMessage — /setproject dispatch', () => {
     });
   });
 
+  test('updates by the DB conversation UUID, not the platform/thread id', async () => {
+    // Regression: handleSetProject previously passed the platform id to
+    // updateConversation (which matches WHERE id = <db UUID>), so on any
+    // conversation whose thread id differs from its DB id the update matched no
+    // rows and threw ConversationNotFoundError.
+    mockGetOrCreateConversation.mockImplementation(() =>
+      Promise.resolve(
+        makeConversation({
+          id: 'db-uuid-42',
+          platform_conversation_id: 'thread-7',
+          codebase_id: null,
+        })
+      )
+    );
+    const cb = makeCodebase('my-app');
+    mockListCodebases.mockImplementation(() => Promise.resolve([cb]));
+    mockParseCommand.mockReturnValue({ command: 'setproject', args: ['my-app'] });
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'thread-7', '/setproject my-app');
+
+    // DB write keyed by the UUID…
+    expect(mockUpdateConversation).toHaveBeenCalledWith('db-uuid-42', {
+      codebase_id: 'id-my-app',
+      cwd: '/repos/my-app',
+    });
+    // …reply still goes to the platform/thread id.
+    expect(platform.sendMessage).toHaveBeenCalledWith(
+      'thread-7',
+      expect.stringContaining('my-app')
+    );
+  });
+
   test('returns not-found message listing available projects', async () => {
     mockListCodebases.mockImplementation(() =>
       Promise.resolve([makeCodebase('project-a'), makeCodebase('project-b')])
