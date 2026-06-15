@@ -53,7 +53,7 @@ import {
   isApprovalContext,
 } from './schemas';
 import { formatToolCall } from './utils/tool-formatter';
-import { createLogger, captureWorkflowCompleted } from '@archon/paths';
+import { createLogger, captureWorkflowCompleted, buildTargetCommandEnv } from '@archon/paths';
 import type { WorkflowErrorClass, WorkflowNodeType } from '@archon/paths';
 import { getWorkflowEventEmitter } from './event-emitter';
 import { evaluateCondition } from './condition-evaluator';
@@ -1677,8 +1677,10 @@ async function executeBashNode(
   const finalScript = substituteNodeOutputRefs(substitutedScript, nodeOutputs, true, logDir);
 
   const timeout = node.timeout ?? SUBPROCESS_DEFAULT_TIMEOUT;
-  const subprocessEnv: NodeJS.ProcessEnv = {
-    ...process.env,
+  // Strip archon-internal infra vars (e.g. DATABASE_URL) from the inherited base
+  // so they can't collide with the target repo's own config; explicit overrides
+  // below still win. See buildTargetCommandEnv / ARCHON_INTERNAL_ENV_KEYS.
+  const subprocessEnv: NodeJS.ProcessEnv = buildTargetCommandEnv({
     ARTIFACTS_DIR: artifactsDir,
     LOG_DIR: logDir,
     BASE_BRANCH: baseBranch,
@@ -1691,7 +1693,7 @@ async function executeBashNode(
     EXTERNAL_CONTEXT: issueContext ?? '',
     ISSUE_CONTEXT: issueContext ?? '',
     ...(envVars ?? {}),
-  };
+  });
 
   try {
     const { stdout, stderr } = await execFileAsync('bash', ['-c', finalScript], {
@@ -1852,13 +1854,15 @@ async function executeScriptNode(
   const finalScript = substituteNodeOutputRefs(substitutedScript, nodeOutputs, false);
 
   const timeout = node.timeout ?? SUBPROCESS_DEFAULT_TIMEOUT;
-  const subprocessEnv: NodeJS.ProcessEnv = {
-    ...process.env,
+  // Strip archon-internal infra vars (e.g. DATABASE_URL) from the inherited base
+  // so they can't collide with the target repo's own config; explicit overrides
+  // below still win. See buildTargetCommandEnv / ARCHON_INTERNAL_ENV_KEYS.
+  const subprocessEnv: NodeJS.ProcessEnv = buildTargetCommandEnv({
     ARTIFACTS_DIR: artifactsDir,
     LOG_DIR: logDir,
     BASE_BRANCH: baseBranch,
     ...(envVars ?? {}),
-  };
+  });
 
   // Build the command and args based on runtime and inline vs named
   let cmd = '';
@@ -2560,8 +2564,11 @@ async function executeLoopNode(
         await execFileAsync('bash', ['-c', substitutedBash], {
           cwd,
           timeout: SUBPROCESS_DEFAULT_TIMEOUT,
-          env: {
-            ...process.env,
+          // Strip archon-internal infra vars (e.g. DATABASE_URL) from the
+          // inherited base so they can't collide with the target repo's own
+          // config; explicit overrides below still win. See
+          // buildTargetCommandEnv / ARCHON_INTERNAL_ENV_KEYS.
+          env: buildTargetCommandEnv({
             USER_MESSAGE: workflowRun.user_message,
             ARGUMENTS: workflowRun.user_message,
             LOOP_USER_INPUT: i === startIteration ? (loopUserInput ?? '') : '',
@@ -2575,7 +2582,7 @@ async function executeLoopNode(
             // executeBashNode/executeScriptNode do — otherwise until_bash would
             // inherit the server's ambient GH token and bypass the scrub.
             ...(config.envVars ?? {}),
-          },
+          }),
         });
         bashComplete = true; // exit 0 = complete
       } catch (e) {

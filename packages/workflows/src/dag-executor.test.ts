@@ -1806,6 +1806,67 @@ describe('executeDagWorkflow -- bash nodes', () => {
     execSpy.mockRestore();
   });
 
+  it('strips archon-internal DATABASE_URL from bash subprocess env but keeps managed creds', async () => {
+    // Simulate ~/.archon/.env having loaded archon's own infra vars into process.env.
+    process.env.DATABASE_URL = 'postgres://archon-internal/db';
+    process.env.GH_TOKEN = 'ghp_managed_token';
+    const execSpy = spyOn(git, 'execFileAsync').mockResolvedValue({ stdout: 'ok\n', stderr: '' });
+    try {
+      await executeDagWorkflow(
+        createMockDeps(),
+        createMockPlatform(),
+        'conv-bash-strip',
+        testDir,
+        { name: 'bash-strip-test', nodes: [{ id: 'stats', bash: 'echo ok' }] },
+        makeWorkflowRun('bash-strip-run-id'),
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      const env = execSpy.mock.calls[0]?.[2]?.env as NodeJS.ProcessEnv;
+      expect(env.DATABASE_URL).toBeUndefined();
+      // Managed credential (not on the denylist) still reaches the command.
+      expect(env.GH_TOKEN).toBe('ghp_managed_token');
+    } finally {
+      execSpy.mockRestore();
+      delete process.env.DATABASE_URL;
+      delete process.env.GH_TOKEN;
+    }
+  });
+
+  it('lets config.envVars re-provide DATABASE_URL to a bash subprocess (override wins)', async () => {
+    process.env.DATABASE_URL = 'postgres://archon-internal/db';
+    const execSpy = spyOn(git, 'execFileAsync').mockResolvedValue({ stdout: 'ok\n', stderr: '' });
+    try {
+      await executeDagWorkflow(
+        createMockDeps(),
+        createMockPlatform(),
+        'conv-bash-override',
+        testDir,
+        { name: 'bash-override-test', nodes: [{ id: 'stats', bash: 'echo ok' }] },
+        makeWorkflowRun('bash-override-run-id'),
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        { ...minimalConfig, envVars: { DATABASE_URL: 'postgres://target/explicit' } }
+      );
+
+      const env = execSpy.mock.calls[0]?.[2]?.env as NodeJS.ProcessEnv;
+      expect(env.DATABASE_URL).toBe('postgres://target/explicit');
+    } finally {
+      execSpy.mockRestore();
+      delete process.env.DATABASE_URL;
+    }
+  });
+
   it('bash node output with shell metacharacters does not inject into downstream bash script', async () => {
     const mockDeps = createMockDeps();
     const platform = createMockPlatform();
@@ -4521,6 +4582,70 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
         (mockDeps.store.failWorkflowRun as Mock<(id: string, error: string) => Promise<void>>).mock
           .calls.length
       ).toBe(1);
+    });
+
+    it('strips archon-internal DATABASE_URL from until_bash subprocess env (override wins)', async () => {
+      process.env.DATABASE_URL = 'postgres://archon-internal/db';
+      // execFileAsync resolving (exit 0) makes the until_bash check report complete.
+      const execSpy = spyOn(git, 'execFileAsync').mockResolvedValue({ stdout: '', stderr: '' });
+      mockSendQueryDag.mockImplementation(function* () {
+        yield { type: 'assistant', content: 'iteration output' };
+        yield { type: 'result', sessionId: 'until-bash-sid' };
+      });
+
+      const loopNode = {
+        id: 'gate',
+        loop: {
+          prompt: 'Run the gate.',
+          until: 'COMPLETE',
+          until_bash: 'test -z "$DATABASE_URL"',
+          max_iterations: 3,
+        },
+      };
+
+      try {
+        await executeDagWorkflow(
+          createMockDeps(),
+          createMockPlatform(),
+          'conv-until-bash-strip',
+          testDir,
+          { name: 'until-bash-strip-test', nodes: [loopNode] },
+          makeWorkflowRun('until-bash-strip-run-id'),
+          'claude',
+          undefined,
+          join(testDir, 'artifacts'),
+          join(testDir, 'logs'),
+          'main',
+          'docs/',
+          minimalConfig
+        );
+
+        const strippedEnv = execSpy.mock.calls[0]?.[2]?.env as NodeJS.ProcessEnv;
+        expect(strippedEnv.DATABASE_URL).toBeUndefined();
+        execSpy.mockClear();
+
+        await executeDagWorkflow(
+          createMockDeps(),
+          createMockPlatform(),
+          'conv-until-bash-override',
+          testDir,
+          { name: 'until-bash-override-test', nodes: [loopNode] },
+          makeWorkflowRun('until-bash-override-run-id'),
+          'claude',
+          undefined,
+          join(testDir, 'artifacts'),
+          join(testDir, 'logs'),
+          'main',
+          'docs/',
+          { ...minimalConfig, envVars: { DATABASE_URL: 'postgres://target/explicit' } }
+        );
+
+        const overrideEnv = execSpy.mock.calls[0]?.[2]?.env as NodeJS.ProcessEnv;
+        expect(overrideEnv.DATABASE_URL).toBe('postgres://target/explicit');
+      } finally {
+        execSpy.mockRestore();
+        delete process.env.DATABASE_URL;
+      }
     });
 
     it('completes on final iteration with XML-wrapped signal (<COMPLETE>SIGNAL</COMPLETE>)', async () => {
@@ -8553,6 +8678,60 @@ describe('executeDagWorkflow -- script nodes', () => {
       })
     );
     execSpy.mockRestore();
+  });
+
+  it('strips archon-internal DATABASE_URL from script subprocess env (override wins)', async () => {
+    process.env.DATABASE_URL = 'postgres://archon-internal/db';
+    const execSpy = spyOn(git, 'execFileAsync').mockResolvedValue({ stdout: 'ok\n', stderr: '' });
+    try {
+      await executeDagWorkflow(
+        createMockDeps(),
+        createMockPlatform(),
+        'conv-script-strip',
+        testDir,
+        {
+          name: 'script-strip-test',
+          nodes: [{ id: 'inline-bun', script: 'console.log("ok")', runtime: 'bun' }],
+        },
+        makeWorkflowRun('script-strip-run-id'),
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      const strippedEnv = execSpy.mock.calls[0]?.[2]?.env as NodeJS.ProcessEnv;
+      expect(strippedEnv.DATABASE_URL).toBeUndefined();
+      execSpy.mockClear();
+
+      await executeDagWorkflow(
+        createMockDeps(),
+        createMockPlatform(),
+        'conv-script-override',
+        testDir,
+        {
+          name: 'script-override-test',
+          nodes: [{ id: 'inline-bun', script: 'console.log("ok")', runtime: 'bun' }],
+        },
+        makeWorkflowRun('script-override-run-id'),
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        { ...minimalConfig, envVars: { DATABASE_URL: 'postgres://target/explicit' } }
+      );
+
+      const overrideEnv = execSpy.mock.calls[0]?.[2]?.env as NodeJS.ProcessEnv;
+      expect(overrideEnv.DATABASE_URL).toBe('postgres://target/explicit');
+    } finally {
+      execSpy.mockRestore();
+      delete process.env.DATABASE_URL;
+    }
   });
 });
 
