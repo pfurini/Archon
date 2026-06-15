@@ -1,5 +1,12 @@
 # Cursor Provider (community) — Implementation Plan
 
+> **Superseded by `cursor-node-sidecar.plan.md` (Phase 2).** The in-process execution
+> design here — decision #6 (static/direct `@cursor/sdk` import) and the
+> `JsonlLocalAgentStore` choice (decision #2 / §9b) — is reversed: the SDK now runs in a
+> Node sidecar (it deadlocks in git repos under Bun), and storage switched to the SDK-default
+> `SqliteLocalAgentStore`. The translation/usage/redact/config/capabilities layers documented
+> here are unchanged and still authoritative.
+
 **Branch:** `feat/cursor-provider` (worktree at `/Users/paolof/Developer/ai/archon-cursor-provider`,
 forked off `feat/claude-terminal-provider` @ `336a2876`).
 **Status:** DRAFT — awaiting approval.

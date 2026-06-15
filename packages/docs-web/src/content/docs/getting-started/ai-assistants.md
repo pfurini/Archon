@@ -339,8 +339,13 @@ nodes:
 
 Cursor is registered as `builtIn: false` — a bundled community provider, not a core built-in.
 
-:::caution[Source / `bun run` installs only — not the compiled binary]
-`@cursor/sdk` statically depends on the native `sqlite3` module, which cannot load inside a `bun build --compile` single-file binary (sqlite3's `bindings` resolver walks the filesystem for `node_modules`, which doesn't exist in the binary's virtual root). The provider is therefore loaded via a lazy dynamic import: on a **source / `bun run` install it is fully functional**; in the **compiled binary** Archon boots normally but a `cursor` run returns a clean `cursor_sdk_unavailable` error instead of crashing the process. Use Cursor from a source checkout (or `bun run`/Docker source image), not the standalone compiled binary.
+:::caution[Source / `bun run` installs only — requires `node` on PATH]
+The `@cursor/sdk` tool runtime (Read/Grep/Shell) **deadlocks in any git repository** when the SDK runs in-process under Bun (Archon's runtime) — it works correctly under Node. Because Archon executes every workflow inside a git worktree, the provider runs the SDK in a short-lived **Node subprocess** (a sidecar). This means:
+
+- **`node` must be on PATH.** If it isn't, a `cursor` run returns a clean `cursor_node_unavailable` error (it never crashes the process).
+- **Source / `bun run` install required.** The sidecar resolves `@cursor/sdk` from `node_modules`, which the compiled single-file binary doesn't have. Use Cursor from a source checkout (or `bun run`/Docker source image), not the standalone compiled binary.
+
+This also sidesteps the SDK's native-`sqlite3` `bun build --compile` incompatibility entirely — the SDK (and its sqlite3) now load only under Node, never in Archon's Bun process.
 :::
 
 ### Install
@@ -356,7 +361,7 @@ The provider reads a Cursor API key from the environment (or, on multi-user inst
 CURSOR_API_KEY=crsr_...
 ```
 
-Resolution order per request: `requestOptions.env.CURSOR_API_KEY` (Archon's per-user / codebase-scoped injection) → ambient `process.env.CURSOR_API_KEY`. The key is passed inline to the SDK and never logged.
+Resolution order per request: `requestOptions.env.CURSOR_API_KEY` (Archon's per-user / codebase-scoped injection) → ambient `process.env.CURSOR_API_KEY`. The key is passed to the Node sidecar via its environment and never logged.
 
 **Per-user keys (multi-user installs with `TOKEN_ENCRYPTION_KEY`):** connect the `cursor` vendor like any other —
 
@@ -395,7 +400,7 @@ Phase 1 scope — flags reflect **wired** behavior (the dag-executor warns when 
 
 | Feature | Support | Notes |
 |---|---|---|
-| Session resume | ✅ | `sessionId` = the SDK `agentId`; resume reconstructs the agent against a stable `JsonlLocalAgentStore` under `~/.archon/cursor/` |
+| Session resume | ✅ | `sessionId` = the SDK `agentId`; resume reconstructs the agent against a stable `SqliteLocalAgentStore` under `~/.archon/cursor/store/` (the sidecar's `index.db` routes resume by `agentId`, not by cwd — so it survives worktree recreation) |
 | MCP servers | ✅ | `mcp: path/to/servers.json` → `AgentOptions.mcpServers` (env vars expanded from the request env) |
 | Structured output | ✅ best-effort | `output_format:` — schema appended to the prompt, JSON extracted + validated; re-asked up to 3× on a miss |
 | Sandbox | ✅ | `sandbox: true` → `LocalAgentOptions.sandboxOptions.enabled` |
