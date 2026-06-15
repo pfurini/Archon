@@ -3202,10 +3202,37 @@ export async function executeDagWorkflow(
   // and downstream consumers must see the fresh output, not the cached one.
   if (priorCompletedNodes && priorCompletedNodes.size > 0) {
     const alwaysRunIds = new Set(workflow.nodes.filter(n => n.always_run).map(n => n.id));
+    const nodeDefById = new Map(workflow.nodes.map(n => [n.id, n]));
     let prepopulatedCount = 0;
     for (const [nodeId, output] of priorCompletedNodes) {
       if (alwaysRunIds.has(nodeId)) continue;
-      nodeOutputs.set(nodeId, { state: 'completed', output });
+      // Re-derive the producer's declared field set so a resumed command/prompt
+      // node resolves `$node.output.field` identically to a fresh run: a
+      // declared-optional-absent field → '' (declared-schema path), not a
+      // 'missing-key' throw (schemaless path). `declaredFields` is a pure
+      // function of the re-parsed `output_format`, and the field VALUE is
+      // recovered by re-parsing the persisted JSON output — so nothing extra
+      // needs to be persisted in the node event. Only executeNode (command/
+      // prompt) attaches declaredFields when fresh; loops use the lenient
+      // structuredOutput path and bash/script are schemaless, so re-deriving for
+      // those would change their resume semantics — restrict it to AI nodes.
+      const def = nodeDefById.get(nodeId);
+      let declaredFields: string[] | undefined;
+      if (
+        def !== undefined &&
+        !isLoopNode(def) &&
+        !isApprovalNode(def) &&
+        !isCancelNode(def) &&
+        !isBashNode(def) &&
+        !isScriptNode(def)
+      ) {
+        declaredFields = declaredFieldsFromSchema(def.output_format);
+      }
+      nodeOutputs.set(nodeId, {
+        state: 'completed',
+        output,
+        ...(declaredFields !== undefined ? { declaredFields } : {}),
+      });
       prepopulatedCount++;
     }
     getLog().info(

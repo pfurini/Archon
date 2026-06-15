@@ -4351,6 +4351,67 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
     expect(mockSendQueryDag.mock.calls.length).toBe(1);
   });
 
+  it('resumed structured producer resolves a declared-optional ABSENT field to "" (not a missing-key throw)', async () => {
+    // Regression: a resumed producer was pre-populated schemaless, so a
+    // downstream `$producer.output.<optional>` ref that resolves to '' on a
+    // FRESH run threw 'missing-key' after resume. Re-deriving declaredFields
+    // from the (re-parsed) output_format restores the declared-schema path.
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    let capturedPrompt = '';
+    mockSendQueryDag.mockImplementation(function* (prompt: string) {
+      capturedPrompt = prompt;
+      yield { type: 'assistant', content: 'done' };
+      yield { type: 'result', sessionId: 'session-id' };
+    });
+
+    // `classify` completed in the prior run with only the REQUIRED field; `note`
+    // is declared-optional and absent. Persisted output is the JSON payload.
+    const priorCompletedNodes = new Map([['classify', '{"type":"BUG"}']]);
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-resume',
+      testDir,
+      {
+        name: 'resume-optional-field',
+        nodes: [
+          {
+            id: 'classify',
+            prompt: 'Classify',
+            output_format: {
+              type: 'object',
+              properties: { type: { type: 'string' }, note: { type: 'string' } },
+              required: ['type'],
+            },
+          },
+          { id: 'step2', prompt: 'Note: $classify.output.note', depends_on: ['classify'] },
+        ],
+      } as Parameters<typeof executeDagWorkflow>[4],
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      priorCompletedNodes
+    );
+
+    // step2 ran (the optional ref resolved instead of throwing pre-sendQuery)…
+    expect(mockSendQueryDag.mock.calls.length).toBe(1);
+    // …and the declared-optional absent field substituted to ''.
+    expect(capturedPrompt).toBe('Note: ');
+    expect(store.failWorkflowRun as ReturnType<typeof mock>).not.toHaveBeenCalled();
+  });
+
   it('pre-populates nodeOutputs so downstream nodes can use $nodeId.output', async () => {
     const store = createMockStore();
     const mockDeps = createMockDeps(store);
