@@ -469,10 +469,19 @@ export async function executeWorkflow(
   // Resolve provider and model once (used by all nodes). Literal model strings
   // keep the existing workflow/provider/config chain; tier and @alias refs use
   // the resolved preset provider/model so bundled workflows are portable.
-  let resolvedProvider: string = workflow.provider ?? config.assistant;
+  // A providerless+modelless workflow must honor the run starter's per-user
+  // default assistant (e.g. `archon ai default codex --scope user`) the same
+  // way `aiProfile` was rebased above — otherwise the user's default only takes
+  // effect through tier/alias model refs, never plain workflows.
+  let resolvedProvider: string =
+    workflow.provider ?? userAiPrefs.defaultProvider ?? config.assistant;
   let resolvedModel: string | undefined;
   let workflowPreset: ModelAliasPreset | undefined;
-  let providerSource = workflow.provider ? 'workflow definition' : 'config';
+  let providerSource = workflow.provider
+    ? 'workflow definition'
+    : userAiPrefs.defaultProvider
+      ? 'user default'
+      : 'config';
   if (workflow.model) {
     const workflowModelSpec = resolveModelSpec(aiProfile, workflow.model);
     if (isLiteralSpec(workflowModelSpec)) {

@@ -1262,6 +1262,29 @@ describe('telemetry wiring', () => {
     expect(mockExecuteDagWorkflow.mock.calls[0]?.[6]).toBe('codex');
   });
 
+  it('per-user default provider applies to a providerless+modelless workflow', async () => {
+    const store = makeStore();
+    const deps = {
+      ...makeDeps(store),
+      getUserAiPrefs: mock(async () => ({ defaultProvider: 'codex' })),
+    } as WorkflowDeps;
+
+    // No `provider`, no `model` on the workflow: previously this fell straight
+    // back to config.assistant, silently ignoring the user's default.
+    await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-1',
+      '/tmp',
+      makeWorkflow(),
+      'msg',
+      'db-conv-1',
+      { userId: 'user-1' }
+    );
+
+    expect(mockExecuteDagWorkflow.mock.calls[0]?.[6]).toBe('codex');
+  });
+
   it('passes undefined source when the caller does not supply one', async () => {
     const store = makeStore();
     const deps = makeDeps(store);
