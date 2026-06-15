@@ -385,12 +385,21 @@ export const BASH_NODE_AI_FIELDS: readonly string[] = [
 export const SCRIPT_NODE_AI_FIELDS: readonly string[] = BASH_NODE_AI_FIELDS;
 
 /**
- * AI-specific fields that are unsupported on loop nodes.
- * `model` and `provider` are excluded because the DAG executor resolves and
- * forwards them to each iteration's AI call (see dag-executor.ts:2602-2648).
+ * AI-specific fields that are unsupported (no-op) on loop nodes — drives the
+ * loader's `loop_node_ai_fields_ignored` warning.
+ *
+ * Excluded because the DAG executor DOES resolve and forward them to each
+ * iteration's AI call (via `resolveNodeProviderAndModel` → `loopOptions`, spread
+ * into every iteration's `sendQuery`):
+ *   - `model` / `provider` — loop-level model selection.
+ *   - `effort` / `thinking` — portable reasoning-depth knobs; they reach each
+ *     iteration (and `loop.escalate` itself carries `effort`), so flagging them
+ *     as ignored is wrong. (The executor in fact forwards the full resolved
+ *     nodeConfig — mcp/hooks/skills/etc. — to each iteration; only the verified
+ *     reasoning-depth pair is reclassified here.)
  */
 export const LOOP_NODE_AI_FIELDS: readonly string[] = BASH_NODE_AI_FIELDS.filter(
-  f => f !== 'model' && f !== 'provider'
+  f => f !== 'model' && f !== 'provider' && f !== 'effort' && f !== 'thinking'
 );
 
 // ---------------------------------------------------------------------------

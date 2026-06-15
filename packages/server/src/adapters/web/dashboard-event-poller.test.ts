@@ -11,7 +11,7 @@ mock.module('@archon/core/db/workflow-events', () => ({
   listWorkflowEventsSince: mockListSince,
 }));
 
-import { DashboardEventPoller } from './dashboard-event-poller';
+import { DashboardEventPoller, parseEventEpochMs } from './dashboard-event-poller';
 import type { DashboardTransport } from './dashboard-event-poller';
 import { mapWorkflowEventRow } from './workflow-bridge';
 
@@ -129,6 +129,26 @@ describe('mapWorkflowEventRow', () => {
     expect(mapWorkflowEventRow(row({ event_type: 'tool_completed' }))).toBeNull();
     expect(mapWorkflowEventRow(row({ event_type: 'node_session_resumed' }))).toBeNull();
     expect(mapWorkflowEventRow(row({ event_type: 'workflow_artifact' }))).toBeNull();
+  });
+});
+
+describe('parseEventEpochMs', () => {
+  test('treats a timezone-less SQLite string as UTC (not local time)', () => {
+    // SQLite stores datetime('now') as "YYYY-MM-DD HH:MM:SS" with NO timezone.
+    // It must parse as UTC; `new Date('2026-06-15 12:00:00')` would parse local,
+    // drifting the cursor by the host offset on a non-UTC host.
+    expect(parseEventEpochMs('2026-06-15 12:00:00')).toBe(Date.UTC(2026, 5, 15, 12, 0, 0));
+  });
+
+  test('a UTC ISO string and the SQLite shape for the same instant agree', () => {
+    expect(parseEventEpochMs('2026-06-15 12:00:00')).toBe(
+      parseEventEpochMs('2026-06-15T12:00:00.000Z')
+    );
+  });
+
+  test('passes a Date through unchanged (node-postgres timestamptz path)', () => {
+    const d = new Date('2026-06-15T12:00:00.000Z');
+    expect(parseEventEpochMs(d)).toBe(d.getTime());
   });
 });
 

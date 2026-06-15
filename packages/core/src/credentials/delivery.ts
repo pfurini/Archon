@@ -87,12 +87,22 @@ export interface DeliveryOptions {
  * we could never deliver. Legacy agent-keyed ids are accepted via
  * {@link normalizeCredentialVendor}, not listed here.
  */
-export const KNOWN_VENDORS: ReadonlySet<string> = new Set<string>(
+/**
+ * Native-only vendors that have a {@link deliverCredential} rule but are NOT Pi
+ * backends, so they don't appear in the generated `PI_PROVIDER_ENV_VARS`.
+ * `cursor` is the first: it's consumed only by the native cursor provider via
+ * `@cursor/sdk`, never by Pi. Listed here so `getVendorCatalog` doesn't reject
+ * the cursor registration's `api_key` credential at bootstrap.
+ */
+const NATIVE_ONLY_VENDORS: readonly string[] = ['cursor'];
+
+export const KNOWN_VENDORS: ReadonlySet<string> = new Set<string>([
   // Every key-vendor in the generated map is deliverable. Ambient-ONLY vendors
   // (amazon-bedrock) are absent from the env map by construction; google-vertex
   // appears in both (API key OR ambient ADC) and stays connectable.
-  Object.keys(PI_PROVIDER_ENV_VARS)
-);
+  ...Object.keys(PI_PROVIDER_ENV_VARS),
+  ...NATIVE_ONLY_VENDORS,
+]);
 
 /**
  * Map the stored OpenAI subscription blob onto the Codex CLI `auth.json` shape
@@ -182,6 +192,16 @@ export function deliverCredential(
           COPILOT_GITHUB_TOKEN: cred.kind === 'api_key' ? cred.apiKey : cred.oauthApiKey,
         },
       };
+
+    case 'cursor':
+      // Cursor is api_key-only in Phase 1 (no subscription/OAuth). The native
+      // cursor provider reads CURSOR_API_KEY from the run env (requestOptions.env).
+      if (cred.kind === 'api_key') {
+        return { env: { CURSOR_API_KEY: cred.apiKey } };
+      }
+      // The registration declares only `api_key`, so connect never stores an
+      // oauth row for cursor — reaching here is a bug, not a fallback.
+      throw new Error("Vendor 'cursor' has no OAuth delivery; connect a CURSOR_API_KEY instead.");
 
     default: {
       // Happy path first: any vendor in the generated env map delivers its

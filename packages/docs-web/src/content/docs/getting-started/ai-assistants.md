@@ -18,7 +18,7 @@ When a workflow node sets `output_format`, the guarantee level depends on the pr
 | Provider | Tier | How it works | On a validation miss |
 |----------|------|--------------|----------------------|
 | Claude, Codex, OpenCode | **enforced** | The SDK/backend grammar-constrains decoding (`output_config.format` / `outputSchema` / `format:{json_schema}`). | The node **fails** — a refusal or `max_tokens` truncation can still bypass grammar enforcement, so the parsed output is validated post-parse for these too. No reask (a failure here is a genuine edge). |
-| Pi, Copilot | **best-effort** | The schema is appended to the prompt; JSON is extracted from the response and structurally repaired (trailing commas, single quotes, truncated tails). | The executor re-asks (prompt + the schema errors) up to **3×**; if still invalid, the node **fails loudly**. |
+| Pi, Copilot, Cursor | **best-effort** | The schema is appended to the prompt; JSON is extracted from the response and structurally repaired (trailing commas, single quotes, truncated tails). | The executor re-asks (prompt + the schema errors) up to **3×**; if still invalid, the node **fails loudly**. |
 
 In all cases the parsed output is **validated against your `output_format` schema** before downstream nodes see it, and a node that declares `output_format` but produces no schema-valid output **fails** rather than silently degrading. See [Authoring Workflows → `output_format`](/guides/authoring-workflows/#output_format-for-structured-json) for field-access (`$node.output.field`) semantics.
 
@@ -332,6 +332,128 @@ nodes:
 
 - [Adding a Community Provider](../contributing/adding-a-community-provider/) — the contributor-facing guide for extending Archon with your own provider.
 - [OpenCode on GitHub](https://github.com/opencode-ai/opencode) — upstream project.
+
+## Cursor (Community Provider)
+
+**SDK-backed community provider.** Archon's Cursor adapter drives the beta [`@cursor/sdk`](https://www.npmjs.com/package/@cursor/sdk) (`Agent.create → agent.send → run.stream()`), giving you Cursor-routed models — Composer (Cursor-native), plus Claude, GPT, Gemini, and Grok — under a single `provider: cursor` entry billed against one Cursor subscription / API key.
+
+Cursor is registered as `builtIn: false` — a bundled community provider, not a core built-in.
+
+:::caution[Source / `bun run` installs only — requires `node` on PATH]
+The `@cursor/sdk` tool runtime (Read/Grep/Shell) **deadlocks in any git repository** when the SDK runs in-process under Bun (Archon's runtime) — it works correctly under Node. Because Archon executes every workflow inside a git worktree, the provider runs the SDK in a short-lived **Node subprocess** (a sidecar). This means:
+
+- **`node` must be on PATH.** If it isn't, a `cursor` run returns a clean `cursor_node_unavailable` error (it never crashes the process).
+- **Source / `bun run` install required.** The sidecar resolves `@cursor/sdk` from `node_modules`, which the compiled single-file binary doesn't have. Use Cursor from a source checkout (or `bun run`/Docker source image), not the standalone compiled binary.
+
+This also sidesteps the SDK's native-`sqlite3` `bun build --compile` incompatibility entirely — the SDK (and its sqlite3) now load only under Node, never in Archon's Bun process.
+:::
+
+### Install
+
+Cursor is included as a dependency of `@archon/providers` — `bun install` pulls in the SDK automatically. It's available immediately on a source install.
+
+### Authenticate
+
+The provider reads a Cursor API key from the environment (or, on multi-user installs, your per-user connected key). Generate a key in Cursor → **Settings → API Keys**.
+
+```bash
+# ~/.archon/.env (or the process environment)
+CURSOR_API_KEY=crsr_...
+```
+
+Resolution order per request: `requestOptions.env.CURSOR_API_KEY` (Archon's per-user / codebase-scoped injection) → ambient `process.env.CURSOR_API_KEY`. The key is passed to the Node sidecar via its environment and never logged.
+
+**Per-user keys (multi-user installs with `TOKEN_ENCRYPTION_KEY`):** connect the `cursor` vendor like any other —
+
+```bash
+archon ai key set cursor          # masked prompt
+echo "$CURSOR_API_KEY" | archon ai key set cursor
+```
+
+Cursor is **api-key only** in Phase 1 (no subscription/OAuth login).
+
+### Configuration Options
+
+```yaml
+assistants:
+  cursor:
+    model: composer-2.5   # default when none is set on node/workflow/tier
+    fast: false           # billing tier (default false = standard, ~6× cheaper). true = premium.
+    context: 1m           # optional context-window request: '1m' | 'max' | a literal catalog value
+    allowPremiumOnDegraded: false  # if the catalog can't be reached, proceed at premium instead of blocking
+```
+
+The built-in default is `composer-2.5` (Cursor-native, balanced) — a bare `provider: cursor` with no model resolves to it. List the live catalog with the SDK's `Cursor.models.list()`.
+
+### Model tiers
+
+The `small` / `medium` / `large` tier keywords resolve to concrete Cursor model ids out of the box (override in `tiers:`):
+
+| Tier | Model |
+|---|---|
+| `small` | `gemini-3.5-flash` |
+| `medium` | `composer-2.5` |
+| `large` | `gemini-3.1-pro` |
+
+Model ids are plain Cursor ids (no `[1m]` suffix — that's Claude-SDK syntax).
+
+### Model parameters & billing tier (effort / thinking / context / fast)
+
+Archon translates its canonical knobs into Cursor's per-model [`ModelSelection.params`](https://www.npmjs.com/package/@cursor/sdk), **validated against the live `Cursor.models.list()` catalog** (durably cached under `~/.archon/cursor/`):
+
+| Knob | Source | Cursor param | Notes |
+|---|---|---|---|
+| `effort` | node/workflow `effort:` (`low`/`medium`/`high`/`max`) | `effort` (Claude) **or** `reasoning` (GPT) | The id is swapped per model; `max` clamps to the model's highest rung (Claude `xhigh`/`max`, GPT `extra-high`). |
+| `thinking` | node/workflow `thinking:` | `thinking` (`true`/`false`) | `enabled`→`true`, `disabled`→`false`, **`adaptive`→`true`** (Cursor thinking is binary — a documented lossy mapping). |
+| `context` | `assistants.cursor.context` | `context` | `1m`/`max` → the model's largest window; a literal (e.g. `272k`) is used verbatim when the model supports it. |
+| `fast` | `assistants.cursor.fast` | `fast` (`true`/`false`) | **Billing tier.** See below. |
+
+**Billing default — standard tier (`fast=false`).** Cursor's own server default is `fast=true` (**premium**, ~6× pricier). Archon runs background workflows, not live IDE iteration, so it **explicitly sends `fast=false`** (standard) unless you set `assistants.cursor.fast: true`. Set `true` to opt into premium.
+
+**Minimal & fail-loud.** Only the knobs actually in play are sent — an un-set param keeps the model's own default; hidden/default-variant params are never emitted. A knob the resolved model **can't express** (e.g. `thinking` on a GPT model, or `effort` on a model without it) makes the run **fail loudly** (`cursor_model_params_unavailable`) rather than silently dropping it.
+
+**Degraded-catalog policy (fail closed, not open to premium).** If the model catalog is truly unreachable (cold cache + a failed refresh), the standard-tier default can't be validated. Rather than silently billing premium, the run is **blocked** with a visible error — unless you set `assistants.cursor.allowPremiumOnDegraded: true`, which proceeds param-less (premium tier) plus a visible warning. The catalog keeps a durable last-good snapshot, so this is rare (a first-ever run with no network).
+
+**Observability caveat.** The SDK does **not** report the server-resolved params or the billed tier — `run.wait().model` echoes the request and `system.model` is undefined for local agents. Archon controls the request shape; **confirm the billed tier once on the Cursor dashboard.**
+
+### Supported Archon Features
+
+Phase 1 scope — flags reflect **wired** behavior (the dag-executor warns when a node uses an ignored feature):
+
+| Feature | Support | Notes |
+|---|---|---|
+| Session resume | ✅ (same worktree) | `sessionId` = the SDK `agentId`; the store is a stable `SqliteLocalAgentStore` under `~/.archon/cursor/store/` (one `index.db`, file-locked so parallel sidecar processes can't corrupt it). **Caveat:** the SDK keys resume by the agent's working directory — resume recalls prior context only when the run executes in the **same worktree path** it was created in (Archon's worktree paths are deterministic per conversation/branch, so sequential turns resume correctly). It does **not** survive a worktree being torn down and recreated. |
+| MCP servers | ✅ | `mcp: path/to/servers.json` → `AgentOptions.mcpServers` (env vars expanded from the request env) |
+| Structured output | ✅ best-effort | `output_format:` — schema appended to the prompt, JSON extracted + validated; re-asked up to 3× on a miss |
+| Sandbox | ✅ | `sandbox: true` → `LocalAgentOptions.sandboxOptions.enabled` |
+| Codebase env vars (`envInjection`) | ❌ | local Cursor agents take no per-call env map (cloud-only in the SDK) |
+| Skills | ❌ | workspace auto-load only (`.cursor/rules`, `AGENTS.md` via `settingSources: ['project']`); no per-node injection |
+| Inline agents (`agents:`) | ❌ | feasible via `AgentOptions.agents`; deferred past Phase 1 |
+| Tool restrictions | ❌ | no per-call allow/deny surface exposed |
+| Effort / reasoning control | ✅ | node `effort:` → the model's `effort`/`reasoning` param (catalog-validated, id-swapped, `max`-clamped). Explicit + unsupported → fail-loud. See [Model parameters](#model-parameters--billing-tier-effort--thinking--context--fast). |
+| Thinking control | ✅ | node `thinking:` → the model's `thinking` param (`enabled`/`adaptive`→`true`, `disabled`→`false`). Explicit + unsupported → fail-loud. |
+| Fallback model | ❌ | no native failover |
+| Cost limits (`maxBudgetUsd`) | ❌ | no runtime budget enforcement |
+| Native tools | ❌ | so the orchestrator appends the bash run-management prompt for project-scoped chat (same path as Codex/OpenCode/Copilot) |
+
+### Usage in workflows
+
+```yaml
+name: my-workflow
+provider: cursor
+model: composer-2.5
+
+nodes:
+  - id: analyze
+    prompt: 'Analyze the codebase structure'
+    # per-node model override:
+    # model: gemini-3.1-pro
+```
+
+### See also
+
+- [Adding a Community Provider](../contributing/adding-a-community-provider/) — the contributor-facing guide.
+- [`@cursor/sdk` on npm](https://www.npmjs.com/package/@cursor/sdk) — upstream SDK.
 
 ## Pi (Community Provider)
 

@@ -7,7 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Cursor provider now passes per-model parameters (`effort` / `thinking` / context-window / `fast`).**
+  Node/workflow `effort:` and `thinking:` translate to the resolved model's Cursor
+  `ModelSelection.params` (id-swapped `effort`↔`reasoning`, `max`-clamped per model), and
+  `assistants.cursor.context` requests a context window — all **validated against the live
+  `Cursor.models.list()` catalog** (durably cached under `~/.archon/cursor/`). Only the knobs in
+  play are emitted; a knob the resolved model can't express **fails loud**
+  (`cursor_model_params_unavailable`) instead of being silently dropped. `effortControl` and
+  `thinkingControl` capabilities are now enabled for Cursor.
+
+### Changed
+
+- **Billing change: Cursor runs now bill at the STANDARD tier by default, not premium.**
+  Cursor's own server default is `fast=true` (premium, ~6× more expensive). Archon now explicitly
+  sends `fast=false` (standard) for Cursor runs unless you opt back in with `assistants.cursor.fast: true`.
+  If the model catalog is unreachable and the standard default can't be applied, the run is **blocked**
+  (fail-closed) rather than silently billing premium — set `assistants.cursor.allowPremiumOnDegraded: true`
+  to proceed at premium with a visible warning. Revertible by flipping the single default constant.
+
 ### Fixed
+
+- **Cursor run failures now surface the SDK's actual error instead of a bare `run error`.**
+  When `@cursor/sdk` returns an error-status run with no result detail, the provider now threads
+  the sidecar's captured stderr tail (where the SDK logs the real reason — rate limit, tool failure,
+  upstream overload) into the result, so the failure is diagnosable from logs instead of an opaque
+  `cursor_error — run error`. Error-status finals are finalized after the sidecar exits so the tail
+  is available; successful runs are unaffected (finalized inline, zero added latency).
 
 - **DAG nodes no longer silently complete when `idle_timeout` fires before any output is produced.**
   Previously, an idle timeout with zero output was incorrectly recorded as `completed`. Now it fails

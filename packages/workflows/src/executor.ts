@@ -197,27 +197,46 @@ async function resolveUserProviderEnvForWorkflow(
 ): Promise<Record<string, string>> {
   const perUserEnabled = deps.isPerUserProviderKeysEnabled?.() ?? false;
   if (!perUserEnabled || !userId || !deps.getUserProviderEnv) return {};
+
+  let env: Record<string, string>;
+  let files: { path: string; contents: string }[];
   try {
-    // TODO(#1891 PR-3): when Codex OAuth delivery is enabled, file-write failures
-    // must drop only the affected provider's env keys, not all of them. Move file
-    // writes into getUserProviderEnv per-delivery so env + write are atomic
-    // per-provider, or wrap each write in a per-file try-catch that strips the
-    // matching env keys on failure. Currently safe: no OAuth rows can be created
-    // in PR-1 so `files` is always empty and this loop never executes.
-    const { env, files } = await deps.getUserProviderEnv(userId, artifactsDir);
-    for (const f of files) {
-      await mkdir(dirname(f.path), { recursive: true });
-      await writeFile(f.path, f.contents, { encoding: 'utf8', mode: 0o600 });
-    }
-    const envKeys = Object.keys(env);
-    if (envKeys.length > 0) {
-      getLog().debug({ userId, keys: envKeys }, 'workflow.user_provider_env_injected');
-    }
-    return env;
+    ({ env, files } = await deps.getUserProviderEnv(userId, artifactsDir));
   } catch (err) {
+    // Resolution itself failed (decrypt / DB) — no opinion, inherit ambient.
     getLog().warn({ err: err as Error, userId }, 'workflow.user_provider_env_resolve_failed');
     return {};
   }
+
+  // Write each delivery file independently. Now that OAuth subscriptions are
+  // connectable, `files` can be non-empty (Codex `CODEX_HOME/auth.json`, the
+  // aggregate Pi `auth.json`). A single failed write must NOT discard the whole
+  // env bag — doing so dropped unrelated connected keys/subscriptions and let
+  // the run silently fall back to ambient/install credentials. Isolate the
+  // failure to its own file and keep delivering everything else.
+  //
+  // NOTE (#1891 PR-3): we still cannot drop only the FAILED provider's env keys
+  // here — getUserProviderEnv flattens env+files across providers, so the
+  // env↔file association is lost by the time we write. A failed Codex auth.json
+  // therefore leaves CODEX_HOME set (that provider degrades on its own); the
+  // precise per-provider strip needs grouped deliveries in the core adapter.
+  for (const f of files) {
+    try {
+      await mkdir(dirname(f.path), { recursive: true });
+      await writeFile(f.path, f.contents, { encoding: 'utf8', mode: 0o600 });
+    } catch (err) {
+      getLog().warn(
+        { err: err as Error, userId, path: f.path },
+        'workflow.user_provider_env_file_write_failed'
+      );
+    }
+  }
+
+  const envKeys = Object.keys(env);
+  if (envKeys.length > 0) {
+    getLog().debug({ userId, keys: envKeys }, 'workflow.user_provider_env_injected');
+  }
+  return env;
 }
 
 /**
@@ -469,10 +488,19 @@ export async function executeWorkflow(
   // Resolve provider and model once (used by all nodes). Literal model strings
   // keep the existing workflow/provider/config chain; tier and @alias refs use
   // the resolved preset provider/model so bundled workflows are portable.
-  let resolvedProvider: string = workflow.provider ?? config.assistant;
+  // A providerless+modelless workflow must honor the run starter's per-user
+  // default assistant (e.g. `archon ai default codex --scope user`) the same
+  // way `aiProfile` was rebased above — otherwise the user's default only takes
+  // effect through tier/alias model refs, never plain workflows.
+  let resolvedProvider: string =
+    workflow.provider ?? userAiPrefs.defaultProvider ?? config.assistant;
   let resolvedModel: string | undefined;
   let workflowPreset: ModelAliasPreset | undefined;
-  let providerSource = workflow.provider ? 'workflow definition' : 'config';
+  let providerSource = workflow.provider
+    ? 'workflow definition'
+    : userAiPrefs.defaultProvider
+      ? 'user default'
+      : 'config';
   if (workflow.model) {
     const workflowModelSpec = resolveModelSpec(aiProfile, workflow.model);
     if (isLiteralSpec(workflowModelSpec)) {

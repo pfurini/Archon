@@ -35,6 +35,7 @@ export const WORKFLOW_EVENT_TYPES = [
   'loop_iteration_started',
   'loop_iteration_completed',
   'loop_iteration_failed',
+  'loop_node_escalated',
   'tool_called',
   'tool_completed',
   'ralph_story_started',

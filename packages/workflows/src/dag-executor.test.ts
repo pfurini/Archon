@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, mock, spyOn, type Mock } f
 import { mkdir, writeFile, rm, readFile } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { execFileSync } from 'node:child_process';
 import * as git from '@archon/git';
 
 // --- Mock logger (MUST come before imports of modules under test) ---
@@ -38,13 +39,25 @@ mock.module('@archon/paths', () => ({
 }));
 
 // --- Bootstrap provider registry (after path mocks, before dag-executor import) ---
-import { registerBuiltinProviders, registerPiProvider, clearRegistry } from '@archon/providers';
+import {
+  registerBuiltinProviders,
+  registerPiProvider,
+  registerCursorProvider,
+  registerClaudeTerminalProvider,
+  clearRegistry,
+} from '@archon/providers';
 clearRegistry();
 registerBuiltinProviders();
 // Pi is a community provider (best-effort structured output) — register it so the
 // reask-loop tests can resolve `getProviderCapabilities('pi')` to 'best-effort'.
 // deps.getAgentProvider is mocked, so the real Pi SDK is never loaded.
 registerPiProvider();
+// Cursor + Claude-terminal community providers — registered so the cross-provider
+// session-threading regression tests can resolve two distinct providers without
+// `resolveNodeProviderAndModel` throwing. deps.getAgentProvider is mocked, so the
+// real SDKs are never loaded.
+registerCursorProvider();
+registerClaudeTerminalProvider();
 
 // --- Imports (after mocks) ---
 import {
@@ -1794,6 +1807,67 @@ describe('executeDagWorkflow -- bash nodes', () => {
     execSpy.mockRestore();
   });
 
+  it('strips archon-internal DATABASE_URL from bash subprocess env but keeps managed creds', async () => {
+    // Simulate ~/.archon/.env having loaded archon's own infra vars into process.env.
+    process.env.DATABASE_URL = 'postgres://archon-internal/db';
+    process.env.GH_TOKEN = 'ghp_managed_token';
+    const execSpy = spyOn(git, 'execFileAsync').mockResolvedValue({ stdout: 'ok\n', stderr: '' });
+    try {
+      await executeDagWorkflow(
+        createMockDeps(),
+        createMockPlatform(),
+        'conv-bash-strip',
+        testDir,
+        { name: 'bash-strip-test', nodes: [{ id: 'stats', bash: 'echo ok' }] },
+        makeWorkflowRun('bash-strip-run-id'),
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      const env = execSpy.mock.calls[0]?.[2]?.env as NodeJS.ProcessEnv;
+      expect(env.DATABASE_URL).toBeUndefined();
+      // Managed credential (not on the denylist) still reaches the command.
+      expect(env.GH_TOKEN).toBe('ghp_managed_token');
+    } finally {
+      execSpy.mockRestore();
+      delete process.env.DATABASE_URL;
+      delete process.env.GH_TOKEN;
+    }
+  });
+
+  it('lets config.envVars re-provide DATABASE_URL to a bash subprocess (override wins)', async () => {
+    process.env.DATABASE_URL = 'postgres://archon-internal/db';
+    const execSpy = spyOn(git, 'execFileAsync').mockResolvedValue({ stdout: 'ok\n', stderr: '' });
+    try {
+      await executeDagWorkflow(
+        createMockDeps(),
+        createMockPlatform(),
+        'conv-bash-override',
+        testDir,
+        { name: 'bash-override-test', nodes: [{ id: 'stats', bash: 'echo ok' }] },
+        makeWorkflowRun('bash-override-run-id'),
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        { ...minimalConfig, envVars: { DATABASE_URL: 'postgres://target/explicit' } }
+      );
+
+      const env = execSpy.mock.calls[0]?.[2]?.env as NodeJS.ProcessEnv;
+      expect(env.DATABASE_URL).toBe('postgres://target/explicit');
+    } finally {
+      execSpy.mockRestore();
+      delete process.env.DATABASE_URL;
+    }
+  });
+
   it('bash node output with shell metacharacters does not inject into downstream bash script', async () => {
     const mockDeps = createMockDeps();
     const platform = createMockPlatform();
@@ -2516,6 +2590,713 @@ describe('executeDagWorkflow -- node-level retry for transient errors', () => {
     );
     expect(retryMessages.length).toBeGreaterThan(0);
   }, 5_000);
+});
+
+// Regression coverage for the opaque-provider-error retry fix
+// (docs/plans/loop-transient-error-retry.md). Cursor returns an error-status
+// final with the generic `cursor_error` subtype and no actionable detail; that
+// message matches neither FATAL nor TRANSIENT patterns, so before the fix it
+// classified UNKNOWN and was never retried. (A) carries the structural subtype
+// onto the failed result so the node-level wrapper retries non-loop nodes; (B)
+// retries loop iterations in-place (the wrapper is gated off for loops).
+describe('executeDagWorkflow -- opaque provider-error retry (cursor_error)', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(
+      tmpdir(),
+      `dag-cursor-retry-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    const commandsDir = join(testDir, '.archon', 'commands');
+    await mkdir(commandsDir, { recursive: true });
+    await writeFile(join(commandsDir, 'my-cmd.md'), 'Do something for $USER_MESSAGE');
+
+    mockSendQueryDag.mockClear();
+    mockGetAgentProviderDag.mockClear();
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    }));
+  });
+
+  afterEach(async () => {
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    }));
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup errors
+    }
+  });
+
+  // (A) Structural-signal path: a non-loop node failing with an opaque
+  // cursor_error is retried even though its message matches no TRANSIENT pattern.
+  it('non-loop node retries an opaque cursor_error result and succeeds', async () => {
+    let callCount = 0;
+    mockSendQueryDag.mockImplementation(function* () {
+      callCount++;
+      if (callCount === 1) {
+        // Cursor's opaque error-status final: generic subtype, bare "run error".
+        yield {
+          type: 'result',
+          isError: true,
+          errorSubtype: 'cursor_error',
+          errors: ['run error'],
+        };
+      } else {
+        yield { type: 'assistant', content: 'Recovered' };
+        yield { type: 'result', sessionId: 'cursor-ok' };
+      }
+    });
+
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('dag-cursor-node-run');
+
+    const nodes: DagNode[] = [
+      { id: 'my-node', command: 'my-cmd', retry: { max_attempts: 2, delay_ms: 1 } },
+    ];
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-cursor-node',
+      testDir,
+      { name: 'dag-cursor-node', nodes },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(callCount).toBeGreaterThanOrEqual(2);
+    expect(mockDeps.store.failWorkflowRun as ReturnType<typeof mock>).not.toHaveBeenCalled();
+  }, 5_000);
+
+  // (A) FATAL precedence: an auth-flavored cursor_error must NOT be retried even
+  // though it shares the otherwise-retryable cursor_error subtype.
+  it('non-loop node does NOT retry a FATAL (auth) cursor_error', async () => {
+    let callCount = 0;
+    mockSendQueryDag.mockImplementation(function* () {
+      callCount++;
+      yield {
+        type: 'result',
+        isError: true,
+        errorSubtype: 'cursor_error',
+        errors: ['unauthorized'],
+      };
+    });
+
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('dag-cursor-fatal-run');
+
+    const nodes: DagNode[] = [
+      { id: 'my-node', command: 'my-cmd', retry: { max_attempts: 2, delay_ms: 1 } },
+    ];
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-cursor-fatal',
+      testDir,
+      { name: 'dag-cursor-fatal', nodes },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // FATAL → exactly one attempt, run fails.
+    expect(callCount).toBe(1);
+    expect(mockDeps.store.failWorkflowRun as ReturnType<typeof mock>).toHaveBeenCalled();
+  });
+
+  // (B) Per-iteration retry: a loop iteration that fails once with an opaque
+  // cursor_error is retried in-place and the loop completes. delay_ms is not
+  // configurable for loops (the wrapper is off), so this pays the real 3s base
+  // backoff once — hence the wider timeout.
+  it('loop node retries an opaque cursor_error iteration and completes', async () => {
+    let callCount = 0;
+    mockSendQueryDag.mockImplementation(function* () {
+      callCount++;
+      if (callCount === 1) {
+        yield {
+          type: 'result',
+          isError: true,
+          errorSubtype: 'cursor_error',
+          errors: ['run error'],
+        };
+      } else {
+        yield { type: 'assistant', content: 'All done! <promise>COMPLETE</promise>' };
+        yield { type: 'result', sessionId: 'loop-cursor-ok' };
+      }
+    });
+
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('dag-loop-cursor-run');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-loop-cursor',
+      testDir,
+      {
+        name: 'dag-loop-cursor',
+        nodes: [
+          {
+            id: 'my-loop',
+            loop: { prompt: 'Do a task.', until: 'COMPLETE', max_iterations: 5 },
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // First iteration failed transiently, retried, second succeeded with the signal.
+    expect(callCount).toBe(2);
+    expect(mockDeps.store.failWorkflowRun as ReturnType<typeof mock>).not.toHaveBeenCalled();
+    expect(mockDeps.store.completeWorkflowRun as ReturnType<typeof mock>).toHaveBeenCalled();
+    // The per-iteration retry surfaced a transient-error notice to the platform.
+    const sendCalls = (platform.sendMessage as ReturnType<typeof mock>).mock.calls;
+    const retryMessages = sendCalls.filter(
+      (call: unknown[]) =>
+        typeof call[1] === 'string' && (call[1] as string).includes('transient error')
+    );
+    expect(retryMessages.length).toBeGreaterThan(0);
+  }, 15_000);
+
+  // (B) FATAL precedence inside the loop: an auth-flavored cursor_error fails the
+  // loop immediately without a per-iteration retry.
+  it('loop node does NOT retry a FATAL (auth) cursor_error iteration', async () => {
+    let callCount = 0;
+    mockSendQueryDag.mockImplementation(function* () {
+      callCount++;
+      yield {
+        type: 'result',
+        isError: true,
+        errorSubtype: 'cursor_error',
+        errors: ['credit balance too low'],
+      };
+    });
+
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('dag-loop-fatal-run');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-loop-fatal',
+      testDir,
+      {
+        name: 'dag-loop-fatal',
+        nodes: [
+          {
+            id: 'my-loop',
+            loop: { prompt: 'Do a task.', until: 'COMPLETE', max_iterations: 5 },
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(callCount).toBe(1);
+    expect(mockDeps.store.failWorkflowRun as ReturnType<typeof mock>).toHaveBeenCalled();
+  });
+
+  // No regression / no over-broadening: a non-cursor UNKNOWN loop failure (no
+  // retryable subtype, no TRANSIENT message pattern) still fails without retry.
+  it('loop node does NOT retry a non-retryable UNKNOWN iteration error', async () => {
+    let callCount = 0;
+    mockSendQueryDag.mockImplementation(function* () {
+      callCount++;
+      yield {
+        type: 'result',
+        isError: true,
+        errorSubtype: 'some_other_error',
+        errors: ['a wholly unexpected failure'],
+      };
+    });
+
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('dag-loop-unknown-run');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-loop-unknown',
+      testDir,
+      {
+        name: 'dag-loop-unknown',
+        nodes: [
+          {
+            id: 'my-loop',
+            loop: { prompt: 'Do a task.', until: 'COMPLETE', max_iterations: 5 },
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(callCount).toBe(1);
+    expect(mockDeps.store.failWorkflowRun as ReturnType<typeof mock>).toHaveBeenCalled();
+  });
+});
+
+describe('executeDagWorkflow -- loop model-escalation on stall', () => {
+  let testDir: string;
+
+  // Distinct per-provider sendQuery spies so a test can assert the FALLBACK
+  // client was actually used after escalation (the primary stays on 'claude').
+  let primarySend: ReturnType<typeof mock>;
+  let fallbackSend: ReturnType<typeof mock>;
+
+  /** Make an empty commit on `testDir` to advance HEAD (the loop progress signal). */
+  function commitInTestDir(msg: string): void {
+    execFileSync(
+      'git',
+      [
+        '-C',
+        testDir,
+        '-c',
+        'user.email=t@t',
+        '-c',
+        'user.name=t',
+        'commit',
+        '--allow-empty',
+        '-m',
+        msg,
+      ],
+      { stdio: 'ignore' }
+    );
+  }
+
+  beforeEach(async () => {
+    testDir = join(
+      tmpdir(),
+      `dag-loop-escalate-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    await mkdir(testDir, { recursive: true });
+    mockLogFn.mockClear();
+    mockSendQueryDag.mockClear();
+    mockGetAgentProviderDag.mockClear();
+    primarySend = mock(function* () {
+      yield { type: 'assistant', content: 'working...' };
+      yield { type: 'result', sessionId: 'primary' };
+    });
+    fallbackSend = mock(function* () {
+      yield { type: 'assistant', content: 'All done! <promise>COMPLETE</promise>' };
+      yield { type: 'result', sessionId: 'fallback' };
+    });
+    // Provider-aware: 'claude-terminal' → fallback client; anything else → primary.
+    mockGetAgentProviderDag.mockImplementation((provider: string) =>
+      provider === 'claude-terminal'
+        ? {
+            sendQuery: fallbackSend,
+            getType: () => 'claude-terminal',
+            getCapabilities: mockClaudeCapabilities,
+          }
+        : {
+            sendQuery: primarySend,
+            getType: () => 'claude',
+            getCapabilities: mockClaudeCapabilities,
+          }
+    );
+  });
+
+  afterEach(async () => {
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    }));
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup errors
+    }
+  });
+
+  /** Count loop_node_escalated DB events recorded on a store mock. */
+  function escalationEvents(store: IWorkflowStore): Record<string, unknown>[] {
+    return (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls
+      .map((c: unknown[]) => c[0] as Record<string, unknown>)
+      .filter(e => e.event_type === 'loop_node_escalated');
+  }
+
+  function escalateNode(stallAfter: number, maxIterations = 10): DagNode {
+    return {
+      id: 'impl-loop',
+      loop: {
+        prompt: 'Do work.',
+        until: 'COMPLETE',
+        max_iterations: maxIterations,
+        fresh_context: true,
+        escalate: {
+          provider: 'claude-terminal',
+          model: 'opus',
+          effort: 'high',
+          stall_after: stallAfter,
+        },
+      },
+    } as DagNode;
+  }
+
+  it('escalates to the fallback when the loop stalls (no new commit)', async () => {
+    execFileSync('git', ['-C', testDir, 'init'], { stdio: 'ignore' });
+    commitInTestDir('baseline');
+
+    // Primary commits on its first 2 iterations (progress), then stops (stall).
+    let primaryCalls = 0;
+    primarySend = mock(function* () {
+      primaryCalls++;
+      if (primaryCalls <= 2) commitInTestDir(`c${String(primaryCalls)}`);
+      yield { type: 'assistant', content: 'working...' };
+      yield { type: 'result', sessionId: 'primary' };
+    });
+
+    const mockStore = createMockStore();
+    const mockDeps = createMockDeps(mockStore);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('dag-loop-escalate-run');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-loop-escalate',
+      testDir,
+      { name: 'dag-loop-escalate', nodes: [escalateNode(2)] },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const events = escalationEvents(mockStore);
+    expect(events.length).toBe(1);
+    expect((events[0].data as Record<string, unknown>).reason).toBe('stall');
+    expect((events[0].data as Record<string, unknown>).toProvider).toBe('claude-terminal');
+    // The fallback client ran at least once after escalation, and the run completed.
+    expect(fallbackSend).toHaveBeenCalled();
+    expect(mockStore.completeWorkflowRun as ReturnType<typeof mock>).toHaveBeenCalled();
+    expect(mockStore.failWorkflowRun as ReturnType<typeof mock>).not.toHaveBeenCalled();
+  }, 15_000);
+
+  it('labels the escalated loop session with the fallback provider so the next sequential node does not inherit it', async () => {
+    // Regression: after a loop escalated to its fallback, the layer result was
+    // labelled with the ORIGINAL loop provider. The session boundary then stored
+    // lastSequentialSessionProvider = loopProvider, so a following sequential
+    // node on that same provider inherited the FALLBACK's session id and tried
+    // to --resume it against the wrong backend. The loop must report the
+    // provider that actually produced the session (the fallback).
+    execFileSync('git', ['-C', testDir, 'init'], { stdio: 'ignore' });
+    commitInTestDir('baseline');
+
+    // Primary commits on its first 2 iterations (progress), then stalls.
+    let primaryCalls = 0;
+    primarySend = mock(function* () {
+      primaryCalls++;
+      if (primaryCalls <= 2) commitInTestDir(`c${String(primaryCalls)}`);
+      yield { type: 'assistant', content: 'working...' };
+      yield { type: 'result', sessionId: 'primary' };
+    });
+
+    const mockStore = createMockStore();
+    const mockDeps = createMockDeps(mockStore);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('dag-loop-escalate-boundary-run');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-loop-escalate-boundary',
+      testDir,
+      {
+        name: 'dag-loop-escalate-boundary',
+        nodes: [
+          escalateNode(2),
+          // Sequential follow-up on the ORIGINAL loop provider (claude → primary).
+          { id: 'after', prompt: 'Wrap up.', provider: 'claude', depends_on: ['impl-loop'] },
+        ],
+      } as Parameters<typeof executeDagWorkflow>[4],
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // The loop escalated (so the returned session 'fallback' came from claude-terminal).
+    expect(escalationEvents(mockStore).length).toBe(1);
+    // The 'after' node is the LAST primary (claude) call. It must run on a FRESH
+    // session — the cross-provider boundary rejects the fallback's session id.
+    const afterCall = primarySend.mock.calls[primarySend.mock.calls.length - 1];
+    expect(afterCall[2]).toBeUndefined();
+  }, 15_000);
+
+  it('does NOT escalate a healthy loop that commits every iteration', async () => {
+    execFileSync('git', ['-C', testDir, 'init'], { stdio: 'ignore' });
+    commitInTestDir('baseline');
+
+    // Commits every iteration (always progressing); completes on iteration 5 —
+    // well past stall_after, but never stalls, so it must NOT escalate.
+    let primaryCalls = 0;
+    primarySend = mock(function* () {
+      primaryCalls++;
+      commitInTestDir(`c${String(primaryCalls)}`);
+      if (primaryCalls >= 5) {
+        yield { type: 'assistant', content: 'Done <promise>COMPLETE</promise>' };
+      } else {
+        yield { type: 'assistant', content: 'still working...' };
+      }
+      yield { type: 'result', sessionId: 'primary' };
+    });
+
+    const mockStore = createMockStore();
+    const mockDeps = createMockDeps(mockStore);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('dag-loop-healthy-run');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-loop-healthy',
+      testDir,
+      { name: 'dag-loop-healthy', nodes: [escalateNode(2)] },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(escalationEvents(mockStore).length).toBe(0);
+    expect(fallbackSend).not.toHaveBeenCalled();
+    expect(mockStore.completeWorkflowRun as ReturnType<typeof mock>).toHaveBeenCalled();
+  }, 15_000);
+
+  it('fails the loop when the escalated model also stalls', async () => {
+    execFileSync('git', ['-C', testDir, 'init'], { stdio: 'ignore' });
+    commitInTestDir('baseline');
+
+    // Primary commits twice then stalls → escalates. Fallback never commits and
+    // never completes → after stall_after more no-progress iterations it fails.
+    let primaryCalls = 0;
+    primarySend = mock(function* () {
+      primaryCalls++;
+      if (primaryCalls <= 2) commitInTestDir(`c${String(primaryCalls)}`);
+      yield { type: 'assistant', content: 'working...' };
+      yield { type: 'result', sessionId: 'primary' };
+    });
+    fallbackSend = mock(function* () {
+      yield { type: 'assistant', content: 'still grinding, no commit' };
+      yield { type: 'result', sessionId: 'fallback' };
+    });
+
+    const mockStore = createMockStore();
+    const mockDeps = createMockDeps(mockStore);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('dag-loop-double-stall-run');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-loop-double-stall',
+      testDir,
+      { name: 'dag-loop-double-stall', nodes: [escalateNode(2)] },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // Escalated exactly once (stall), then failed when the fallback also stalled.
+    expect(escalationEvents(mockStore).length).toBe(1);
+    expect(fallbackSend).toHaveBeenCalled();
+    expect(mockStore.failWorkflowRun as ReturnType<typeof mock>).toHaveBeenCalled();
+    const stalledMsg = (platform.sendMessage as ReturnType<typeof mock>).mock.calls.some(
+      (c: unknown[]) =>
+        typeof c[1] === 'string' && (c[1] as string).includes('escalated model also stalled')
+    );
+    expect(stalledMsg).toBe(true);
+  }, 20_000);
+
+  it('composes with the (B) per-iteration retry without counting it as a stall', async () => {
+    execFileSync('git', ['-C', testDir, 'init'], { stdio: 'ignore' });
+    commitInTestDir('baseline');
+
+    // Iteration 1 errors transiently once (retried on the SAME model), then every
+    // completed iteration commits and the loop completes on iteration 2. A
+    // transient-retry must not escalate.
+    let primaryCalls = 0;
+    primarySend = mock(function* () {
+      primaryCalls++;
+      if (primaryCalls === 1) {
+        yield {
+          type: 'result',
+          isError: true,
+          errorSubtype: 'cursor_error',
+          errors: ['run error'],
+        };
+        return;
+      }
+      commitInTestDir(`c${String(primaryCalls)}`);
+      yield { type: 'assistant', content: 'Done <promise>COMPLETE</promise>' };
+      yield { type: 'result', sessionId: 'primary' };
+    });
+
+    const mockStore = createMockStore();
+    const mockDeps = createMockDeps(mockStore);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('dag-loop-compose-run');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-loop-compose',
+      testDir,
+      { name: 'dag-loop-compose', nodes: [escalateNode(2)] },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(escalationEvents(mockStore).length).toBe(0);
+    expect(fallbackSend).not.toHaveBeenCalled();
+    expect(mockStore.completeWorkflowRun as ReturnType<typeof mock>).toHaveBeenCalled();
+  }, 15_000);
+
+  it('escalates once when the primary exhausts its per-iteration retries (§2.4)', async () => {
+    execFileSync('git', ['-C', testDir, 'init'], { stdio: 'ignore' });
+    commitInTestDir('baseline');
+
+    // Primary always errors with an opaque (retryable) cursor_error. Once the
+    // per-iteration retries are spent, the loop escalates to the fallback — which
+    // completes. Escalation here is retry-driven, not stall-driven (no commits).
+    primarySend = mock(function* () {
+      yield { type: 'result', isError: true, errorSubtype: 'cursor_error', errors: ['run error'] };
+    });
+
+    const mockStore = createMockStore();
+    const mockDeps = createMockDeps(mockStore);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('dag-loop-retry-escalate-run');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-loop-retry-escalate',
+      testDir,
+      { name: 'dag-loop-retry-escalate', nodes: [escalateNode(2)] },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const events = escalationEvents(mockStore);
+    expect(events.length).toBe(1);
+    expect((events[0].data as Record<string, unknown>).reason).toBe('retry_exhausted');
+    expect(fallbackSend).toHaveBeenCalled();
+    expect(mockStore.completeWorkflowRun as ReturnType<typeof mock>).toHaveBeenCalled();
+    expect(mockStore.failWorkflowRun as ReturnType<typeof mock>).not.toHaveBeenCalled();
+  }, 25_000);
+
+  it('disables stall detection (no crash) when the cwd is not a git repo', async () => {
+    // testDir exists but is NOT a git repo → readGitHead returns null → stall
+    // detection off (warn). The loop still runs and completes via the signal.
+    primarySend = mock(function* () {
+      yield { type: 'assistant', content: 'Done <promise>COMPLETE</promise>' };
+      yield { type: 'result', sessionId: 'primary' };
+    });
+
+    const mockStore = createMockStore();
+    const mockDeps = createMockDeps(mockStore);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('dag-loop-nogit-run');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-loop-nogit',
+      testDir,
+      { name: 'dag-loop-nogit', nodes: [escalateNode(2)] },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(escalationEvents(mockStore).length).toBe(0);
+    expect(mockStore.completeWorkflowRun as ReturnType<typeof mock>).toHaveBeenCalled();
+    const warned = mockLogFn.mock.calls.some(
+      (c: unknown[]) => c[1] === 'loop_node.stall_detection_unavailable'
+    );
+    expect(warned).toBe(true);
+  }, 15_000);
 });
 
 describe('executeDagWorkflow -- tool_called event persistence', () => {
@@ -3570,6 +4351,67 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
     expect(mockSendQueryDag.mock.calls.length).toBe(1);
   });
 
+  it('resumed structured producer resolves a declared-optional ABSENT field to "" (not a missing-key throw)', async () => {
+    // Regression: a resumed producer was pre-populated schemaless, so a
+    // downstream `$producer.output.<optional>` ref that resolves to '' on a
+    // FRESH run threw 'missing-key' after resume. Re-deriving declaredFields
+    // from the (re-parsed) output_format restores the declared-schema path.
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    let capturedPrompt = '';
+    mockSendQueryDag.mockImplementation(function* (prompt: string) {
+      capturedPrompt = prompt;
+      yield { type: 'assistant', content: 'done' };
+      yield { type: 'result', sessionId: 'session-id' };
+    });
+
+    // `classify` completed in the prior run with only the REQUIRED field; `note`
+    // is declared-optional and absent. Persisted output is the JSON payload.
+    const priorCompletedNodes = new Map([['classify', '{"type":"BUG"}']]);
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-resume',
+      testDir,
+      {
+        name: 'resume-optional-field',
+        nodes: [
+          {
+            id: 'classify',
+            prompt: 'Classify',
+            output_format: {
+              type: 'object',
+              properties: { type: { type: 'string' }, note: { type: 'string' } },
+              required: ['type'],
+            },
+          },
+          { id: 'step2', prompt: 'Note: $classify.output.note', depends_on: ['classify'] },
+        ],
+      } as Parameters<typeof executeDagWorkflow>[4],
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      priorCompletedNodes
+    );
+
+    // step2 ran (the optional ref resolved instead of throwing pre-sendQuery)…
+    expect(mockSendQueryDag.mock.calls.length).toBe(1);
+    // …and the declared-optional absent field substituted to ''.
+    expect(capturedPrompt).toBe('Note: ');
+    expect(store.failWorkflowRun as ReturnType<typeof mock>).not.toHaveBeenCalled();
+  });
+
   it('pre-populates nodeOutputs so downstream nodes can use $nodeId.output', async () => {
     const store = createMockStore();
     const mockDeps = createMockDeps(store);
@@ -4222,6 +5064,70 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
         (mockDeps.store.failWorkflowRun as Mock<(id: string, error: string) => Promise<void>>).mock
           .calls.length
       ).toBe(1);
+    });
+
+    it('strips archon-internal DATABASE_URL from until_bash subprocess env (override wins)', async () => {
+      process.env.DATABASE_URL = 'postgres://archon-internal/db';
+      // execFileAsync resolving (exit 0) makes the until_bash check report complete.
+      const execSpy = spyOn(git, 'execFileAsync').mockResolvedValue({ stdout: '', stderr: '' });
+      mockSendQueryDag.mockImplementation(function* () {
+        yield { type: 'assistant', content: 'iteration output' };
+        yield { type: 'result', sessionId: 'until-bash-sid' };
+      });
+
+      const loopNode = {
+        id: 'gate',
+        loop: {
+          prompt: 'Run the gate.',
+          until: 'COMPLETE',
+          until_bash: 'test -z "$DATABASE_URL"',
+          max_iterations: 3,
+        },
+      };
+
+      try {
+        await executeDagWorkflow(
+          createMockDeps(),
+          createMockPlatform(),
+          'conv-until-bash-strip',
+          testDir,
+          { name: 'until-bash-strip-test', nodes: [loopNode] },
+          makeWorkflowRun('until-bash-strip-run-id'),
+          'claude',
+          undefined,
+          join(testDir, 'artifacts'),
+          join(testDir, 'logs'),
+          'main',
+          'docs/',
+          minimalConfig
+        );
+
+        const strippedEnv = execSpy.mock.calls[0]?.[2]?.env as NodeJS.ProcessEnv;
+        expect(strippedEnv.DATABASE_URL).toBeUndefined();
+        execSpy.mockClear();
+
+        await executeDagWorkflow(
+          createMockDeps(),
+          createMockPlatform(),
+          'conv-until-bash-override',
+          testDir,
+          { name: 'until-bash-override-test', nodes: [loopNode] },
+          makeWorkflowRun('until-bash-override-run-id'),
+          'claude',
+          undefined,
+          join(testDir, 'artifacts'),
+          join(testDir, 'logs'),
+          'main',
+          'docs/',
+          { ...minimalConfig, envVars: { DATABASE_URL: 'postgres://target/explicit' } }
+        );
+
+        const overrideEnv = execSpy.mock.calls[0]?.[2]?.env as NodeJS.ProcessEnv;
+        expect(overrideEnv.DATABASE_URL).toBe('postgres://target/explicit');
+      } finally {
+        execSpy.mockRestore();
+        delete process.env.DATABASE_URL;
+      }
     });
 
     it('completes on final iteration with XML-wrapped signal (<COMPLETE>SIGNAL</COMPLETE>)', async () => {
@@ -8255,6 +9161,60 @@ describe('executeDagWorkflow -- script nodes', () => {
     );
     execSpy.mockRestore();
   });
+
+  it('strips archon-internal DATABASE_URL from script subprocess env (override wins)', async () => {
+    process.env.DATABASE_URL = 'postgres://archon-internal/db';
+    const execSpy = spyOn(git, 'execFileAsync').mockResolvedValue({ stdout: 'ok\n', stderr: '' });
+    try {
+      await executeDagWorkflow(
+        createMockDeps(),
+        createMockPlatform(),
+        'conv-script-strip',
+        testDir,
+        {
+          name: 'script-strip-test',
+          nodes: [{ id: 'inline-bun', script: 'console.log("ok")', runtime: 'bun' }],
+        },
+        makeWorkflowRun('script-strip-run-id'),
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      const strippedEnv = execSpy.mock.calls[0]?.[2]?.env as NodeJS.ProcessEnv;
+      expect(strippedEnv.DATABASE_URL).toBeUndefined();
+      execSpy.mockClear();
+
+      await executeDagWorkflow(
+        createMockDeps(),
+        createMockPlatform(),
+        'conv-script-override',
+        testDir,
+        {
+          name: 'script-override-test',
+          nodes: [{ id: 'inline-bun', script: 'console.log("ok")', runtime: 'bun' }],
+        },
+        makeWorkflowRun('script-override-run-id'),
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        { ...minimalConfig, envVars: { DATABASE_URL: 'postgres://target/explicit' } }
+      );
+
+      const overrideEnv = execSpy.mock.calls[0]?.[2]?.env as NodeJS.ProcessEnv;
+      expect(overrideEnv.DATABASE_URL).toBe('postgres://target/explicit');
+    } finally {
+      execSpy.mockRestore();
+      delete process.env.DATABASE_URL;
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -8976,6 +9936,113 @@ describe('executeDagWorkflow -- typed artifacts (output_type)', () => {
       wrote = false;
     }
     expect(wrote).toBe(false);
+  });
+});
+
+describe('executeDagWorkflow -- cross-provider session threading', () => {
+  // Regression: in-run `lastSequentialSessionId` was threaded to the next
+  // sequential node WITHOUT checking the producing node ran on the same provider.
+  // On a provider change (e.g. cursor → claude-terminal) the downstream provider
+  // received a foreign session id and attempted --resume <id> against a session it
+  // never created (claude-terminal hangs on the "Resume session" picker, times out).
+  // The fix forces a fresh session on a provider boundary.
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(tmpdir(), `dag-xprov-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(join(testDir, '.archon', 'commands'), { recursive: true });
+
+    mockSendQueryDag.mockClear();
+    mockGetAgentProviderDag.mockClear();
+    // Distinct session id per call so we can prove which (if any) is inherited.
+    let callCount = 0;
+    mockSendQueryDag.mockImplementation(function* () {
+      callCount++;
+      yield { type: 'assistant', content: 'AI response' };
+      yield { type: 'result', sessionId: `sid-${String(callCount)}` };
+    });
+  });
+
+  afterEach(async () => {
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    }));
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup errors
+    }
+  });
+
+  it('does NOT inherit the prior session id when the provider changes between sequential nodes', async () => {
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'xprov-sequential',
+        nodes: [
+          { id: 'a', prompt: 'Step A', provider: 'cursor' },
+          { id: 'b', prompt: 'Step B', provider: 'claude-terminal', depends_on: ['a'] },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(mockSendQueryDag.mock.calls.length).toBe(2);
+    // Node A (cursor) runs fresh (no prior sequential session).
+    expect(mockSendQueryDag.mock.calls[0][2]).toBeUndefined();
+    // Node B (claude-terminal) must NOT receive node A's cursor session id —
+    // the provider boundary forces a fresh session.
+    expect(mockSendQueryDag.mock.calls[1][2]).toBeUndefined();
+  });
+
+  it('still inherits the prior session id for a same-provider sequential pair (no regression)', async () => {
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'sameprov-sequential',
+        nodes: [
+          { id: 'a', prompt: 'Step A', provider: 'cursor' },
+          { id: 'b', prompt: 'Step B', provider: 'cursor', depends_on: ['a'] },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(mockSendQueryDag.mock.calls.length).toBe(2);
+    // Node A (cursor) runs fresh.
+    expect(mockSendQueryDag.mock.calls[0][2]).toBeUndefined();
+    // Node B (cursor) inherits node A's session id — continuity preserved.
+    expect(mockSendQueryDag.mock.calls[1][2]).toBe('sid-1');
   });
 });
 

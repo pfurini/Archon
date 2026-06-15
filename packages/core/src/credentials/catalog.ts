@@ -134,6 +134,10 @@ const EXTRA_INSTALL_ENV_VARS: Record<string, string[]> = {
   // own anthropic api_key delivery) — an install configured with only this
   // var is authenticated.
   anthropic: ['CLAUDE_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_OAUTH_TOKEN'],
+  // cursor is native-only (not a Pi backend), so it has no PI_PROVIDER_ENV_VARS
+  // entry — list its env var here so a solo install with CURSOR_API_KEY set
+  // shows the cursor agent as ready.
+  cursor: ['CURSOR_API_KEY'],
 };
 
 function hasInstallEnv(vendor: string): boolean {

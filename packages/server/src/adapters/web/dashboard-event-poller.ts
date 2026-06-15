@@ -27,6 +27,26 @@ const log = createLogger('adapter.web.dashboard-poller');
 const DASHBOARD_STREAM = '__dashboard__';
 /** Max rows per drain. With the event-type filter, a single second won't realistically overflow. */
 const DRAIN_LIMIT = 500;
+
+/** SQLite's `datetime('now')` text shape (UTC, no timezone marker). */
+const SQLITE_TIMESTAMP_RE = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}$/;
+
+/**
+ * Epoch-ms for a workflow-event `created_at`. SQLite stores it as a
+ * timezone-less UTC string ("YYYY-MM-DD HH:MM:SS"); `new Date(...)` would parse
+ * that as LOCAL time on a non-UTC host, drifting the cursor by the local offset
+ * and skipping/replaying events (the cursor round-trips back through
+ * `toDbDateParam` as a UTC string). Treat the bare SQLite shape as UTC; pass
+ * everything else (ISO strings with Z/offset, or the `Date` node-postgres hands
+ * back for timestamptz) straight to `new Date()`.
+ */
+export function parseEventEpochMs(createdAt: string | Date): number {
+  if (createdAt instanceof Date) return createdAt.getTime();
+  const normalized = SQLITE_TIMESTAMP_RE.test(createdAt)
+    ? `${createdAt.replace(' ', 'T')}Z`
+    : createdAt;
+  return new Date(normalized).getTime();
+}
 /** Escalate from warn → error after this many consecutive failed drains (a sustained outage). */
 const FAILURE_ESCALATION_THRESHOLD = 5;
 
@@ -133,7 +153,7 @@ export class DashboardEventPoller {
       if (this.seenAtBoundary.has(row.id)) continue; // already emitted at the boundary second
       const sse = mapWorkflowEventRow(row);
       if (sse) transport.emitWorkflowEvent(DASHBOARD_STREAM, sse);
-      const ts = new Date(row.created_at).getTime();
+      const ts = parseEventEpochMs(row.created_at);
       if (!Number.isNaN(ts) && ts > maxTs) maxTs = ts;
     }
 
@@ -141,7 +161,7 @@ export class DashboardEventPoller {
     // exactly that second so the next `>= cursor` query doesn't re-emit them.
     const nextBoundary = new Set<string>();
     for (const row of rows) {
-      if (new Date(row.created_at).getTime() === maxTs) nextBoundary.add(row.id);
+      if (parseEventEpochMs(row.created_at) === maxTs) nextBoundary.add(row.id);
     }
     this.cursor = new Date(maxTs);
     this.seenAtBoundary = nextBoundary;

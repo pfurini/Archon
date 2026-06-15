@@ -785,6 +785,35 @@ describe('executeWorkflow', () => {
         })
       ).resolves.toBeDefined();
     });
+
+    it('keeps the rest of the env when ONE delivery file fails to write', async () => {
+      // Regression: a single failed file write (e.g. Codex auth.json) used to
+      // collapse the WHOLE credential env to {}, dropping unrelated connected
+      // keys and silently falling back to ambient credentials. Writing to a
+      // directory path (EISDIR) forces a deterministic write failure.
+      const getUserProviderEnv = mock(async () => ({
+        env: { ANTHROPIC_API_KEY: 'sk-user', CODEX_HOME: '/some/codex-home' },
+        files: [{ path: '/tmp', contents: 'would-be-auth.json' }], // '/tmp' is a dir → EISDIR
+      }));
+      const deps: WorkflowDeps = {
+        ...makeDeps(makeStore()),
+        isPerUserProviderKeysEnabled: () => true,
+        getUserProviderEnv,
+      };
+      await executeWorkflow(
+        deps,
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow(),
+        'msg',
+        'db-c1',
+        { userId: 'u-1' }
+      );
+      const configArg = mockExecuteDagWorkflow.mock.calls[0]?.[12] as WorkflowConfig | undefined;
+      // The env bag survived the failed write — the unrelated API key still lands.
+      expect(configArg?.envVars).toMatchObject({ ANTHROPIC_API_KEY: 'sk-user' });
+    });
   });
 
   // -------------------------------------------------------------------------
@@ -1259,6 +1288,29 @@ describe('telemetry wiring', () => {
 
     // No tiers configured anywhere → built-in tier defaults follow the
     // user's default provider, not the install config's.
+    expect(mockExecuteDagWorkflow.mock.calls[0]?.[6]).toBe('codex');
+  });
+
+  it('per-user default provider applies to a providerless+modelless workflow', async () => {
+    const store = makeStore();
+    const deps = {
+      ...makeDeps(store),
+      getUserAiPrefs: mock(async () => ({ defaultProvider: 'codex' })),
+    } as WorkflowDeps;
+
+    // No `provider`, no `model` on the workflow: previously this fell straight
+    // back to config.assistant, silently ignoring the user's default.
+    await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-1',
+      '/tmp',
+      makeWorkflow(),
+      'msg',
+      'db-conv-1',
+      { userId: 'user-1' }
+    );
+
     expect(mockExecuteDagWorkflow.mock.calls[0]?.[6]).toBe('codex');
   });
 

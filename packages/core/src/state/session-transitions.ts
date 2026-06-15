@@ -13,7 +13,8 @@ export type TransitionTrigger =
   | 'isolation-changed' // Working directory/worktree changed
   | 'reset-requested' // User requested /reset
   | 'worktree-removed' // Worktree manually removed
-  | 'conversation-closed'; // Platform conversation closed (issue/PR closed)
+  | 'conversation-closed' // Platform conversation closed (issue/PR closed)
+  | 'provider-changed'; // Resolved AI provider differs from the active session's owner
 
 /**
  * Behavior category for each trigger.
@@ -31,6 +32,7 @@ const TRIGGER_BEHAVIOR: Record<TransitionTrigger, 'creates' | 'deactivates' | 'n
   'reset-requested': 'deactivates',
   'worktree-removed': 'deactivates',
   'conversation-closed': 'deactivates',
+  'provider-changed': 'creates', // Deactivate the old-provider session AND mint a fresh one now
 };
 
 /**

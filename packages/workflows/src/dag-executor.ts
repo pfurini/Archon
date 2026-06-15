@@ -53,7 +53,7 @@ import {
   isApprovalContext,
 } from './schemas';
 import { formatToolCall } from './utils/tool-formatter';
-import { createLogger, captureWorkflowCompleted } from '@archon/paths';
+import { createLogger, captureWorkflowCompleted, buildTargetCommandEnv } from '@archon/paths';
 import type { WorkflowErrorClass, WorkflowNodeType } from '@archon/paths';
 import { getWorkflowEventEmitter } from './event-emitter';
 import { evaluateCondition } from './condition-evaluator';
@@ -72,6 +72,7 @@ import {
 import { withIdleTimeout, STEP_IDLE_TIMEOUT_MS } from './utils/idle-timeout';
 import {
   classifyError,
+  isRetryableProviderErrorSubtype,
   toTelemetryErrorClass,
   detectCreditExhaustion,
   loadCommandPrompt,
@@ -282,7 +283,52 @@ type NodeExecutionResult = NodeOutput & {
   tokens?: TokenUsage;
   /** Loop nodes only: number of iterations executed. */
   loopIterations?: number;
+  /**
+   * Structural provider error subtype for a failed result (e.g. Cursor's opaque
+   * `cursor_error`). Carried from the SDK error-result handlers so the node
+   * retry layer can classify retryability without re-parsing the flattened
+   * message. Internal-only — never zod-validated or persisted.
+   */
+  errorSubtype?: string;
+  /**
+   * The provider that actually produced {@link NodeOutput.sessionId}. Differs
+   * from the node's resolved provider only when a loop node escalated to its
+   * fallback (loop.escalate) and the returned session was created by that
+   * fallback. The layer boundary uses this — not the original loop provider —
+   * to label `lastSequentialSessionProvider`, so a following sequential node on
+   * the original provider isn't handed (and made to --resume) a session id the
+   * fallback created. Undefined ⇒ same as the node's resolved provider.
+   */
+  sessionProvider?: string;
 };
+
+/**
+ * Error thrown when a provider's SDK reports an error-status final result.
+ * Carries the structural {@link errorSubtype} so the retry layer can classify
+ * opaque provider errors (e.g. Cursor's generic `cursor_error`) as retryable
+ * without parsing the flattened message string. FATAL message patterns still
+ * win — the retry decision checks them first — so an auth-flavored variant is
+ * not retried.
+ */
+class ProviderSdkError extends Error {
+  readonly errorSubtype: string;
+  constructor(message: string, errorSubtype: string) {
+    super(message);
+    this.name = 'ProviderSdkError';
+    this.errorSubtype = errorSubtype;
+  }
+}
+
+/**
+ * Per-node result returned from the layer map. `provider` is the node's resolved
+ * provider id, carried so the executor only threads a session id to the next
+ * sequential node when it ran on the SAME provider (cross-provider guard).
+ */
+interface LayerNodeResult {
+  nodeId: string;
+  output: NodeExecutionResult;
+  provider?: string;
+}
 
 /** Throttle state for cancel checks (reads — no write contention in WAL mode) */
 const lastNodeCancelCheck = new Map<string, number>();
@@ -1118,7 +1164,10 @@ async function executeNodeInternal(
             },
             'dag.node_sdk_error_result'
           );
-          throw new Error(`Node '${node.id}' failed: SDK returned ${subtype}${errorsDetail}`);
+          throw new ProviderSdkError(
+            `Node '${node.id}' failed: SDK returned ${subtype}${errorsDetail}`,
+            subtype
+          );
         }
         break; // Result is the "I'm done" signal — don't wait for subprocess to exit
       } else if (msg.type === 'system' && msg.content) {
@@ -1561,6 +1610,7 @@ async function executeNodeInternal(
       error: err.message,
       costUsd: nodeCostUsd,
       ...(nodeTokens !== undefined ? { tokens: nodeTokens } : {}),
+      ...(err instanceof ProviderSdkError ? { errorSubtype: err.errorSubtype } : {}),
     };
   }
 }
@@ -1637,8 +1687,10 @@ async function executeBashNode(
   const finalScript = substituteNodeOutputRefs(substitutedScript, nodeOutputs, true, logDir);
 
   const timeout = node.timeout ?? SUBPROCESS_DEFAULT_TIMEOUT;
-  const subprocessEnv: NodeJS.ProcessEnv = {
-    ...process.env,
+  // Strip archon-internal infra vars (e.g. DATABASE_URL) from the inherited base
+  // so they can't collide with the target repo's own config; explicit overrides
+  // below still win. See buildTargetCommandEnv / ARCHON_INTERNAL_ENV_KEYS.
+  const subprocessEnv: NodeJS.ProcessEnv = buildTargetCommandEnv({
     ARTIFACTS_DIR: artifactsDir,
     LOG_DIR: logDir,
     BASE_BRANCH: baseBranch,
@@ -1651,7 +1703,7 @@ async function executeBashNode(
     EXTERNAL_CONTEXT: issueContext ?? '',
     ISSUE_CONTEXT: issueContext ?? '',
     ...(envVars ?? {}),
-  };
+  });
 
   try {
     const { stdout, stderr } = await execFileAsync('bash', ['-c', finalScript], {
@@ -1812,13 +1864,15 @@ async function executeScriptNode(
   const finalScript = substituteNodeOutputRefs(substitutedScript, nodeOutputs, false);
 
   const timeout = node.timeout ?? SUBPROCESS_DEFAULT_TIMEOUT;
-  const subprocessEnv: NodeJS.ProcessEnv = {
-    ...process.env,
+  // Strip archon-internal infra vars (e.g. DATABASE_URL) from the inherited base
+  // so they can't collide with the target repo's own config; explicit overrides
+  // below still win. See buildTargetCommandEnv / ARCHON_INTERNAL_ENV_KEYS.
+  const subprocessEnv: NodeJS.ProcessEnv = buildTargetCommandEnv({
     ARTIFACTS_DIR: artifactsDir,
     LOG_DIR: logDir,
     BASE_BRANCH: baseBranch,
     ...(envVars ?? {}),
-  };
+  });
 
   // Build the command and args based on runtime and inline vs named
   let cmd = '';
@@ -2021,12 +2075,42 @@ async function executeScriptNode(
 }
 
 /**
+ * Read the current git HEAD commit hash for `cwd`, or null if unavailable.
+ *
+ * Used as the loop escalation progress signal: a per-cycle commit advances HEAD.
+ * Returns null (never throws) on a non-git cwd, a detached/empty repo, or any
+ * git failure, so the caller can degrade gracefully instead of crashing the loop.
+ * Kept as a small internal helper so the progress signal can later become
+ * pluggable (output changed, file mtime, …) without touching the loop logic.
+ */
+async function readGitHead(cwd: string): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync('git', ['-C', cwd, 'rev-parse', 'HEAD'], {
+      timeout: SUBPROCESS_DEFAULT_TIMEOUT,
+    });
+    const head = stdout.trim();
+    return head.length > 0 ? head : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Pre-resolved fallback provider/options for loop model-escalation (see `escalate`). */
+interface LoopEscalation {
+  provider: string;
+  options: SendQueryOptions | undefined;
+}
+
+/**
  * Execute a loop node — runs prompt repeatedly until completion signal or max iterations.
  *
  * Key behaviors:
  * - Returns NodeExecutionResult (not void) — DAG executor owns workflow lifecycle
  * - Receives upstream node outputs for $nodeId.output substitution
  * - Does not write current_step_index (DAG tracks per-node completion)
+ * - Optional escalate-on-stall: when `loop.escalate` is set and the loop makes no
+ *   progress (no new git commit) for `stall_after` consecutive iterations, swap to
+ *   the pre-resolved stronger fallback (`escalation`) for the remaining budget.
  */
 async function executeLoopNode(
   deps: WorkflowDeps,
@@ -2043,9 +2127,11 @@ async function executeLoopNode(
   docsDir: string,
   nodeOutputs: Map<string, NodeOutput>,
   config: WorkflowConfig,
-  issueContext?: string
+  issueContext?: string,
+  escalation?: LoopEscalation
 ): Promise<NodeExecutionResult> {
   const loop = node.loop;
+  const escalate = loop.escalate;
   const msgContext = { workflowId: workflowRun.id, nodeName: node.id };
 
   // Resolve AI client — fail fast with descriptive error
@@ -2081,6 +2167,107 @@ async function executeLoopNode(
   // Helper to log event store errors consistently
   const logEventStoreError = (err: Error, iteration: number): void => {
     getLog().error({ err, nodeId: node.id, iteration }, 'loop_node.iteration_event_failed');
+  };
+
+  // (B) Per-iteration retry for transient/opaque provider errors. The node-level
+  // retry wrapper is gated OFF for loop nodes (see the `!isLoopNode(node)` guard
+  // in the retry decision), so the loop owns its own retry granularity here: a
+  // single transient blip retries just THAT iteration instead of re-entering the
+  // whole loop. Reuses the same retryability decision as the wrapper — FATAL
+  // message patterns are never retried; TRANSIENT patterns and opaque provider
+  // subtypes (e.g. Cursor's `cursor_error`) are. Bounded by the same defaults.
+  const iterationRetries = new Map<number, number>();
+
+  // §13.3 escalate-on-stall state. The active provider/client/options start as the
+  // primary and swap to the pre-resolved `escalation` fallback once the loop stalls.
+  let activeProvider = workflowProvider;
+  let activeClient = aiClient;
+  let activeOptions = resolvedOptions;
+  let escalated = false;
+  let stallCount = 0;
+
+  // Progress baseline (git HEAD). Only armed when `escalate` is configured AND the
+  // cwd is a usable git repo; otherwise stall detection stays off and the loop
+  // behaves exactly as today (escalation can still fire via (B)-retry exhaustion).
+  let stallDetectionEnabled = false;
+  let lastHead: string | null = null;
+  if (escalate) {
+    lastHead = await readGitHead(cwd);
+    if (lastHead) {
+      stallDetectionEnabled = true;
+    } else {
+      getLog().warn({ nodeId: node.id, cwd }, 'loop_node.stall_detection_unavailable');
+    }
+  }
+
+  // Swap the active provider/client/options to the pre-resolved fallback. Returns
+  // false (and changes nothing) when no fallback is available — the caller decides
+  // how to proceed. Records a `loop_node_escalated` DB event + user message so the
+  // §13.3 calibration loop (a separate process reading `workflow_events`) can see
+  // which waves needed escalation.
+  const escalateToFallback = async (
+    reason: 'stall' | 'retry_exhausted',
+    atIteration: number
+  ): Promise<boolean> => {
+    if (!escalation) return false;
+    let fallbackClient: ReturnType<typeof deps.getAgentProvider>;
+    try {
+      fallbackClient = deps.getAgentProvider(escalation.provider);
+    } catch (error) {
+      getLog().error(
+        { err: error as Error, nodeId: node.id, provider: escalation.provider },
+        'loop_node.escalation_provider_failed'
+      );
+      return false;
+    }
+    const fromProvider = activeProvider;
+    const fromModel = activeOptions?.model;
+    const toModel = escalation.options?.model;
+    activeProvider = escalation.provider;
+    activeOptions = escalation.options;
+    activeClient = fallbackClient;
+    escalated = true;
+    stallCount = 0;
+    // A cross-provider session can't resume — force a fresh session next iteration.
+    // (escalate targets fresh_context loops; this also covers fresh_context: false.)
+    currentSessionId = undefined;
+    getLog().warn(
+      {
+        nodeId: node.id,
+        fromProvider,
+        toProvider: activeProvider,
+        fromModel,
+        toModel,
+        atIteration,
+        reason,
+      },
+      'loop_node.escalated'
+    );
+    deps.store
+      .createWorkflowEvent({
+        workflow_run_id: workflowRun.id,
+        event_type: 'loop_node_escalated',
+        step_name: node.id,
+        data: {
+          nodeId: node.id,
+          fromProvider,
+          toProvider: activeProvider,
+          fromModel,
+          toModel,
+          atIteration,
+          reason,
+        },
+      })
+      .catch((err: Error) => {
+        logEventStoreError(err, atIteration);
+      });
+    await safeSendMessage(
+      platform,
+      conversationId,
+      `⏫ Loop \`${node.id}\` escalated to \`${activeProvider}\`${toModel ? ` (${toModel})` : ''} at iteration ${String(atIteration)} (reason: ${reason}).`,
+      msgContext
+    );
+    return true;
   };
 
   for (let i = startIteration; i <= loop.max_iterations; i++) {
@@ -2132,8 +2319,13 @@ async function executeLoopNode(
     // trigger errors (e.g. error_during_execution on Claude SDK).
     // User feedback is carried via $LOOP_USER_INPUT, so session continuity is
     // not required for the first resumed iteration.
+    // Also force a fresh session on a (B) per-iteration retry: the prior attempt
+    // may have advanced the session into a bad state before erroring, so resuming
+    // from it could re-trigger the same failure. Impl-style loops re-read their
+    // plan + progress.md from disk, so session continuity is not required here.
+    const isIterationRetry = (iterationRetries.get(i) ?? 0) > 0;
     const needsFreshSession =
-      loop.fresh_context || i === 1 || (isLoopResume && i === startIteration);
+      loop.fresh_context || i === 1 || (isLoopResume && i === startIteration) || isIterationRetry;
     const resumeSessionId = needsFreshSession ? undefined : currentSessionId;
 
     // Stream AI response for this iteration
@@ -2165,11 +2357,11 @@ async function executeLoopNode(
       const finalPrompt = substituteNodeOutputRefs(substitutedPrompt, nodeOutputs);
 
       const iterationOptions: SendQueryOptions | undefined = {
-        ...resolvedOptions,
+        ...activeOptions,
         abortSignal: iterationAbortController.signal,
       };
 
-      const generator = aiClient.sendQuery(finalPrompt, cwd, resumeSessionId, iterationOptions);
+      const generator = activeClient.sendQuery(finalPrompt, cwd, resumeSessionId, iterationOptions);
       let lastToolStartedAt: { toolName: string; startedAt: number } | null = null;
 
       const effectiveIdleTimeout = node.idle_timeout ?? STEP_IDLE_TIMEOUT_MS;
@@ -2265,8 +2457,9 @@ async function executeLoopNode(
               },
               'loop_node.iteration_sdk_error'
             );
-            throw new Error(
-              `Loop '${node.id}' iteration ${String(i)} failed: SDK returned ${subtype}${errorsDetail}`
+            throw new ProviderSdkError(
+              `Loop '${node.id}' iteration ${String(i)} failed: SDK returned ${subtype}${errorsDetail}`,
+              subtype
             );
           }
           break; // Result is the "I'm done" signal — don't wait for subprocess to exit
@@ -2362,6 +2555,56 @@ async function executeLoopNode(
         .catch((evtErr: Error) => {
           logEventStoreError(evtErr, i);
         });
+
+      // (B) Retry just this iteration on a transient/opaque provider error.
+      // FATAL message patterns (auth, permissions, credits) are never retried,
+      // mirroring the node-level wrapper's precedence; opaque provider subtypes
+      // (e.g. Cursor's `cursor_error`) and TRANSIENT message patterns are.
+      const subtype = err instanceof ProviderSdkError ? err.errorSubtype : undefined;
+      const iterationRetryable =
+        classifyError(err) !== 'FATAL' &&
+        (isTransientNodeError(err.message) || isRetryableProviderErrorSubtype(subtype));
+      const attemptsSoFar = iterationRetries.get(i) ?? 0;
+      if (iterationRetryable && attemptsSoFar < DEFAULT_NODE_MAX_RETRIES) {
+        iterationRetries.set(i, attemptsSoFar + 1);
+        const delayMs = DEFAULT_NODE_RETRY_DELAY_MS * Math.pow(2, attemptsSoFar);
+        getLog().warn(
+          {
+            nodeId: node.id,
+            iteration: i,
+            attempt: attemptsSoFar + 1,
+            maxRetries: DEFAULT_NODE_MAX_RETRIES,
+            delayMs,
+            errorSubtype: subtype,
+            error: err.message,
+          },
+          'loop_node.iteration_transient_retry'
+        );
+        await safeSendMessage(
+          platform,
+          conversationId,
+          `⚠️ Loop \`${node.id}\` iteration ${String(i)} failed with transient error (attempt ${String(attemptsSoFar + 1)}/${String(DEFAULT_NODE_MAX_RETRIES + 1)}). Retrying in ${String(Math.round(delayMs / 1000))}s...`,
+          msgContext
+        );
+        await new Promise(resolve => setTimeout(resolve, delayMs));
+        i--; // re-run this iteration (the for-loop's i++ restores the same index)
+        continue;
+      }
+
+      // §2.4 (B)-exhaustion → escalate once instead of failing. We reach here with
+      // `iterationRetryable` true only after the per-iteration retries above are
+      // spent: the primary keeps erroring transiently, but the fallback provider
+      // may not share the outage. Re-run this iteration on the fallback (with a
+      // fresh retry budget). If already escalated, fall through to the failure.
+      if (iterationRetryable && escalate && !escalated) {
+        const swapped = await escalateToFallback('retry_exhausted', i);
+        if (swapped) {
+          iterationRetries.set(i, 0); // fallback gets its own retry budget
+          i--; // re-run this iteration on the fallback
+          continue;
+        }
+      }
+
       return {
         state: 'failed',
         output: '',
@@ -2469,8 +2712,11 @@ async function executeLoopNode(
         await execFileAsync('bash', ['-c', substitutedBash], {
           cwd,
           timeout: SUBPROCESS_DEFAULT_TIMEOUT,
-          env: {
-            ...process.env,
+          // Strip archon-internal infra vars (e.g. DATABASE_URL) from the
+          // inherited base so they can't collide with the target repo's own
+          // config; explicit overrides below still win. See
+          // buildTargetCommandEnv / ARCHON_INTERNAL_ENV_KEYS.
+          env: buildTargetCommandEnv({
             USER_MESSAGE: workflowRun.user_message,
             ARGUMENTS: workflowRun.user_message,
             LOOP_USER_INPUT: i === startIteration ? (loopUserInput ?? '') : '',
@@ -2484,7 +2730,7 @@ async function executeLoopNode(
             // executeBashNode/executeScriptNode do — otherwise until_bash would
             // inherit the server's ambient GH token and bypass the scrub.
             ...(config.envVars ?? {}),
-          },
+          }),
         });
         bashComplete = true; // exit 0 = complete
       } catch (e) {
@@ -2581,6 +2827,9 @@ async function executeLoopNode(
         state: 'completed',
         output: lastIterationOutput,
         sessionId: currentSessionId,
+        // The session was produced by whatever provider was active at the end —
+        // the fallback if this loop escalated, else the original loop provider.
+        sessionProvider: activeProvider,
         costUsd: loopTotalCostUsd,
         ...(loopTotalTokens !== undefined ? { tokens: loopTotalTokens } : {}),
         loopIterations: i,
@@ -2649,6 +2898,53 @@ async function executeLoopNode(
         ...(loopTotalTokens !== undefined ? { tokens: loopTotalTokens } : {}),
         loopIterations: i,
       };
+    }
+
+    // §13.3 escalate-on-stall backstop. Reached only when this iteration neither
+    // completed nor paused — the loop is about to run another iteration. Measure
+    // progress (did git HEAD advance?) and escalate, or fail if already escalated.
+    if (escalate) {
+      if (stallDetectionEnabled) {
+        const headNow = await readGitHead(cwd);
+        if (headNow === null) {
+          // Transient git read failure mid-loop: do NOT treat as no-progress —
+          // counting it would push toward false escalation. Leave state unchanged.
+          getLog().warn({ nodeId: node.id, iteration: i }, 'loop_node.stall_head_read_skipped');
+        } else if (headNow !== lastHead) {
+          stallCount = 0;
+          lastHead = headNow;
+        } else {
+          stallCount++;
+        }
+      }
+
+      if (stallCount >= escalate.stall_after) {
+        if (!escalated) {
+          const swapped = await escalateToFallback('stall', i);
+          if (!swapped) {
+            // Fallback unavailable (shouldn't happen — pre-resolved at dispatch).
+            // Don't crash; let the loop run on to the max_iterations backstop.
+            getLog().error({ nodeId: node.id, iteration: i }, 'loop_node.escalation_unavailable');
+          }
+        } else {
+          // Already on the fallback and it ALSO stalled — fail rather than thrash
+          // the expensive model for the rest of the iteration budget.
+          const stalledMsg = `Loop node '${node.id}' escalated model also stalled (no progress for ${String(escalate.stall_after)} iterations, last at iteration ${String(i)})`;
+          getLog().warn(
+            { nodeId: node.id, iteration: i, stallAfter: escalate.stall_after },
+            'loop_node.escalated_stalled'
+          );
+          await safeSendMessage(platform, conversationId, stalledMsg, msgContext);
+          return {
+            state: 'failed',
+            output: lastIterationOutput,
+            error: stalledMsg,
+            costUsd: loopTotalCostUsd,
+            ...(loopTotalTokens !== undefined ? { tokens: loopTotalTokens } : {}),
+            loopIterations: i,
+          };
+        }
+      }
     }
   }
 
@@ -2906,10 +3202,37 @@ export async function executeDagWorkflow(
   // and downstream consumers must see the fresh output, not the cached one.
   if (priorCompletedNodes && priorCompletedNodes.size > 0) {
     const alwaysRunIds = new Set(workflow.nodes.filter(n => n.always_run).map(n => n.id));
+    const nodeDefById = new Map(workflow.nodes.map(n => [n.id, n]));
     let prepopulatedCount = 0;
     for (const [nodeId, output] of priorCompletedNodes) {
       if (alwaysRunIds.has(nodeId)) continue;
-      nodeOutputs.set(nodeId, { state: 'completed', output });
+      // Re-derive the producer's declared field set so a resumed command/prompt
+      // node resolves `$node.output.field` identically to a fresh run: a
+      // declared-optional-absent field → '' (declared-schema path), not a
+      // 'missing-key' throw (schemaless path). `declaredFields` is a pure
+      // function of the re-parsed `output_format`, and the field VALUE is
+      // recovered by re-parsing the persisted JSON output — so nothing extra
+      // needs to be persisted in the node event. Only executeNode (command/
+      // prompt) attaches declaredFields when fresh; loops use the lenient
+      // structuredOutput path and bash/script are schemaless, so re-deriving for
+      // those would change their resume semantics — restrict it to AI nodes.
+      const def = nodeDefById.get(nodeId);
+      let declaredFields: string[] | undefined;
+      if (
+        def !== undefined &&
+        !isLoopNode(def) &&
+        !isApprovalNode(def) &&
+        !isCancelNode(def) &&
+        !isBashNode(def) &&
+        !isScriptNode(def)
+      ) {
+        declaredFields = declaredFieldsFromSchema(def.output_format);
+      }
+      nodeOutputs.set(nodeId, {
+        state: 'completed',
+        output,
+        ...(declaredFields !== undefined ? { declaredFields } : {}),
+      });
       prepopulatedCount++;
     }
     getLog().info(
@@ -2937,6 +3260,11 @@ export async function executeDagWorkflow(
   // Session threading: for sequential single-node layers, thread the session forward.
   // For parallel layers (>1 node), always fresh (can't share a session).
   let lastSequentialSessionId: string | undefined;
+  // Provider that produced lastSequentialSessionId. A provider session id is only
+  // resumable by the SAME provider that created it, so we must not thread a session
+  // across a provider boundary (e.g. cursor → claude-terminal): the downstream
+  // provider would attempt --resume <id> against a session it never created.
+  let lastSequentialSessionProvider: string | undefined;
   // Note: all four usage accumulators cover this invocation only. If this is a
   // resume, nodes skipped from the prior run are not included — cost, tokens,
   // and loop iterations all reflect the resumed portion only.
@@ -2958,11 +3286,12 @@ export async function executeDagWorkflow(
 
     if (isParallelLayer) {
       lastSequentialSessionId = undefined; // reset — parallel nodes can't share sessions
+      lastSequentialSessionProvider = undefined;
     }
 
     // Execute all nodes in the layer concurrently
     const layerResults = await Promise.allSettled(
-      layer.map(async (node): Promise<{ nodeId: string; output: NodeExecutionResult }> => {
+      layer.map(async (node): Promise<LayerNodeResult> => {
         try {
           // 0. Skip if this node completed successfully in a prior run (resume path).
           // `always_run: true` opts the node out of resume caching — re-execute even
@@ -3179,6 +3508,46 @@ export async function executeDagWorkflow(
                 workflowPreset
               );
 
+            // Pre-resolve the escalation fallback (provider/model/options) here so
+            // resolution stays in one place and validates before the loop runs. The
+            // fallback's `model` is a literal (takes the isLiteralSpec branch — no
+            // model/provider-conflict warning). Per-node capability fields are
+            // stripped from the synthetic node so a never-escalating loop doesn't
+            // emit duplicate capability warnings for the fallback provider.
+            let escalation: LoopEscalation | undefined;
+            if (node.loop.escalate) {
+              const esc = node.loop.escalate;
+              const escalateSyntheticNode: DagNode = {
+                ...node,
+                provider: esc.provider ?? loopProvider,
+                model: esc.model,
+                ...(esc.effort ? { effort: esc.effort } : {}),
+                allowed_tools: undefined,
+                denied_tools: undefined,
+                hooks: undefined,
+                mcp: undefined,
+                skills: undefined,
+                agents: undefined,
+              };
+              const resolvedFallback = await resolveNodeProviderAndModel(
+                escalateSyntheticNode,
+                workflowProvider,
+                workflowModel,
+                config,
+                platform,
+                conversationId,
+                workflowRun.id,
+                cwd,
+                workflowLevelOptions,
+                aiProfile,
+                workflowPreset
+              );
+              escalation = {
+                provider: resolvedFallback.provider,
+                options: resolvedFallback.options,
+              };
+            }
+
             const output = await executeLoopNode(
               deps,
               platform,
@@ -3194,9 +3563,18 @@ export async function executeDagWorkflow(
               docsDir,
               nodeOutputs,
               config,
-              issueContext
+              issueContext,
+              escalation
             );
-            return { nodeId: node.id, output };
+            // Label the layer result with the provider that actually produced
+            // the session (the fallback if this loop escalated), so the
+            // sequential session boundary doesn't hand the fallback's session id
+            // to a later node resolving to the original loop provider.
+            return {
+              nodeId: node.id,
+              output,
+              provider: output.sessionProvider ?? loopProvider,
+            };
           }
 
           // 3c. Approval node dispatch — pauses workflow for human review
@@ -3300,9 +3678,28 @@ export async function executeDagWorkflow(
           // a parallel-layer node CAN still use persist_session — it just doesn't share with siblings.
           const isFreshSequential = isParallelLayer || node.context === 'fresh';
           const bypassesPersistence = node.context === 'fresh';
-          let resumeSessionId: string | undefined = isFreshSequential
-            ? undefined
-            : lastSequentialSessionId;
+          // Cross-provider guard: an in-run session id is only resumable by the
+          // provider that created it. If the previous sequential node ran on a
+          // different provider, inheriting its session id would make this provider
+          // attempt --resume <id> (or equivalent) against a session it never
+          // created (e.g. claude-terminal hanging on the "Resume session" picker).
+          // Force a fresh session on the provider boundary.
+          const crossesProviderBoundary =
+            !isFreshSequential &&
+            lastSequentialSessionId !== undefined &&
+            lastSequentialSessionProvider !== provider;
+          if (crossesProviderBoundary) {
+            getLog().debug(
+              {
+                nodeId: node.id,
+                previousProvider: lastSequentialSessionProvider,
+                currentProvider: provider,
+              },
+              'dag.session_reset_provider_boundary'
+            );
+          }
+          let resumeSessionId: string | undefined =
+            isFreshSequential || crossesProviderBoundary ? undefined : lastSequentialSessionId;
 
           const nodePersistFlag = 'persist_session' in node ? node.persist_session : undefined;
           // Strictly opt-in: off unless the node sets persist_session, or the workflow
@@ -3415,9 +3812,18 @@ export async function executeDagWorkflow(
             const isFatal = output.error
               ? classifyError(new Error(output.error)) === 'FATAL'
               : false;
-            const isTransient = output.error ? isTransientNodeError(output.error) : false;
+            // TRANSIENT by message pattern OR by structural provider subtype
+            // (e.g. Cursor's opaque `cursor_error`). The subtype signal is an
+            // additional input, classified AFTER isFatal so FATAL still wins.
+            const isTransient =
+              (output.error ? isTransientNodeError(output.error) : false) ||
+              isRetryableProviderErrorSubtype(output.errorSubtype);
+            // Loop nodes own their own per-iteration retry (see executeLoopNode);
+            // the coarse whole-loop wrapper retry is gated off to avoid redoing
+            // already-committed iterations and compounding retries.
             const shouldRetry =
               !isFatal &&
+              !isLoopNode(node) &&
               (retryConfig.onError === 'all' ||
                 (retryConfig.onError === 'transient' && isTransient));
 
@@ -3499,7 +3905,7 @@ export async function executeDagWorkflow(
             }
           }
 
-          return { nodeId: node.id, output };
+          return { nodeId: node.id, output, provider };
         } catch (error) {
           const err = error as Error;
           getLog().error({ err, nodeId: node.id }, 'dag_node_pre_execution_failed');
@@ -3539,7 +3945,7 @@ export async function executeDagWorkflow(
     let layerHadFailure = false;
     for (const result of layerResults) {
       if (result.status === 'fulfilled') {
-        const { nodeId, output } = result.value;
+        const { nodeId, output, provider: nodeProvider } = result.value;
         // SINGLE aggregation point for run-level usage telemetry. Per-node
         // cost/tokens must be summed here and ONLY here — adding a per-node
         // telemetry capture elsewhere would double-count against the totals
@@ -3587,6 +3993,10 @@ export async function executeDagWorkflow(
         }
         if (output.state === 'completed' && !isParallelLayer && output.sessionId !== undefined) {
           lastSequentialSessionId = output.sessionId;
+          // Track the producing provider so the next sequential node only inherits
+          // this session id when it resolves to the SAME provider (see the
+          // cross-provider guard in the session-determination block above).
+          lastSequentialSessionProvider = nodeProvider;
         }
         if (output.state === 'failed') layerHadFailure = true;
       } else {

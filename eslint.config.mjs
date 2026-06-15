@@ -20,7 +20,7 @@ export default tseslint.config(
       '.archon/**', // User workflow/script/command content — not in any tsconfig project
       '**/*.generated.ts', // Auto-generated source files (content inlined via JSON.stringify)
       '**/*.js',
-      '*.mjs',
+      '**/*.mjs', // config files + the cursor Node sidecar (not in any tsconfig project)
       '**/*.test.ts',
       '**/src/test/**', // Test helper files (mock factories, fixtures)
       '*.d.ts', // Root-level declaration files (not in tsconfig project scope)

@@ -86,8 +86,9 @@ const mockUpdateSession = mock(() => Promise.resolve());
 const mockTransitionSession = mock(() =>
   Promise.resolve({ id: 'session-1', assistant_session_id: null })
 );
+const mockGetActiveSession = mock((): Promise<unknown> => Promise.resolve(null));
 mock.module('../db/sessions', () => ({
-  getActiveSession: mock(() => Promise.resolve(null)),
+  getActiveSession: mockGetActiveSession,
   updateSession: mockUpdateSession,
   transitionSession: mockTransitionSession,
 }));
@@ -2068,6 +2069,81 @@ describe('handleMessage — workflow context injection', () => {
   });
 });
 
+// ─── Cross-provider session reset (resolved provider ≠ active session owner) ──
+
+describe('resets the chat session when the resolved provider changes', () => {
+  beforeEach(() => {
+    mockUpdateSession.mockClear();
+    mockTransitionSession.mockClear();
+    mockGetActiveSession.mockReset();
+    mockGetActiveSession.mockResolvedValue(null);
+    mockGetOrCreateConversation.mockReset();
+    mockGetOrCreateConversation.mockImplementation(() => Promise.resolve(makeConversation()));
+    mockGetCodebase.mockReset();
+    mockGetCodebase.mockImplementation(() => Promise.resolve(null));
+    mockSendQuery.mockReset();
+    mockSendQuery.mockImplementation(async function* () {
+      yield { type: 'result', sessionId: 'new-sid' };
+    });
+    mockListCodebases.mockReset();
+    mockListCodebases.mockImplementation(() => Promise.resolve([]));
+    mockDiscoverWorkflowsWithConfig.mockReset();
+    mockDiscoverWorkflowsWithConfig.mockImplementation(() =>
+      Promise.resolve({ workflows: [], errors: [] })
+    );
+    mockGetRecentWorkflowResultMessages.mockReset();
+    mockGetRecentWorkflowResultMessages.mockImplementation(() => Promise.resolve([]));
+  });
+
+  test('transitions to a fresh session and does NOT forward the prior provider session id', async () => {
+    // Active session was minted by a DIFFERENT provider than this turn resolves
+    // to. Its session id is only resumable by its owner — forwarding it would
+    // make the new provider --resume a session it never created.
+    mockGetActiveSession.mockResolvedValueOnce({
+      id: 'session-old',
+      assistant_session_id: 'old-provider-sid',
+      ai_assistant_type: 'some-old-provider', // never equals the resolved provider
+      codebase_id: null,
+    });
+    mockTransitionSession.mockResolvedValueOnce({
+      id: 'session-new',
+      assistant_session_id: null,
+    });
+
+    const platform = makePlatform();
+    (platform.getStreamingMode as ReturnType<typeof mock>).mockReturnValue('stream');
+    await handleMessage(platform, 'conv-1', 'hello');
+
+    // A provider-changed transition minted a fresh session…
+    const providerChanged = mockTransitionSession.mock.calls.find(
+      (c: unknown[]) => c[1] === 'provider-changed'
+    );
+    expect(providerChanged).toBeDefined();
+    // …and the new provider was queried with NO resume id (fresh), not the old one.
+    expect(mockSendQuery.mock.calls[0][2]).toBeUndefined();
+  });
+
+  test('reuses the existing session id when the provider is unchanged', async () => {
+    // Conversation default is 'claude'; the resolved provider stays 'claude', so
+    // the active claude session must be reused (no spurious transition/reset).
+    mockGetActiveSession.mockResolvedValueOnce({
+      id: 'session-1',
+      assistant_session_id: 'claude-sid',
+      ai_assistant_type: 'claude',
+      codebase_id: null,
+    });
+
+    const platform = makePlatform();
+    (platform.getStreamingMode as ReturnType<typeof mock>).mockReturnValue('stream');
+    await handleMessage(platform, 'conv-1', 'hello');
+
+    expect(
+      mockTransitionSession.mock.calls.some((c: unknown[]) => c[1] === 'provider-changed')
+    ).toBe(false);
+    expect(mockSendQuery.mock.calls[0][2]).toBe('claude-sid');
+  });
+});
+
 // ─── Stale session ID clearing on error_during_execution ────────────────────
 
 describe('stale session ID clearing on error_during_execution', () => {
@@ -2681,6 +2757,39 @@ describe('handleMessage — /setproject dispatch', () => {
       codebase_id: 'id-archon-my-api',
       cwd: '/repos/archon-my-api',
     });
+  });
+
+  test('updates by the DB conversation UUID, not the platform/thread id', async () => {
+    // Regression: handleSetProject previously passed the platform id to
+    // updateConversation (which matches WHERE id = <db UUID>), so on any
+    // conversation whose thread id differs from its DB id the update matched no
+    // rows and threw ConversationNotFoundError.
+    mockGetOrCreateConversation.mockImplementation(() =>
+      Promise.resolve(
+        makeConversation({
+          id: 'db-uuid-42',
+          platform_conversation_id: 'thread-7',
+          codebase_id: null,
+        })
+      )
+    );
+    const cb = makeCodebase('my-app');
+    mockListCodebases.mockImplementation(() => Promise.resolve([cb]));
+    mockParseCommand.mockReturnValue({ command: 'setproject', args: ['my-app'] });
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'thread-7', '/setproject my-app');
+
+    // DB write keyed by the UUID…
+    expect(mockUpdateConversation).toHaveBeenCalledWith('db-uuid-42', {
+      codebase_id: 'id-my-app',
+      cwd: '/repos/my-app',
+    });
+    // …reply still goes to the platform/thread id.
+    expect(platform.sendMessage).toHaveBeenCalledWith(
+      'thread-7',
+      expect.stringContaining('my-app')
+    );
   });
 
   test('returns not-found message listing available projects', async () => {

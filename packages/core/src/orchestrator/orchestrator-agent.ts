@@ -1060,7 +1060,9 @@ export async function handleMessage(
 
         if (command === 'setproject') {
           getLog().debug({ command, conversationId }, 'deterministic_command');
-          const result = await handleSetProject(message, conversationId);
+          // Pass the DB conversation UUID (updateConversation matches WHERE id),
+          // not the platform/thread id used for replies.
+          const result = await handleSetProject(message, conversation.id);
           await platform.sendMessage(conversationId, result);
           return;
         }
@@ -1186,14 +1188,8 @@ export async function handleMessage(
       cwd = await ensureArchonWorkspacesPath();
     }
 
-    // 4. Update activity and get/create session
+    // 4. Update activity (session is resolved AFTER the provider below).
     await db.touchConversation(conversation.id);
-    let session = await sessionDb.getActiveSession(conversation.id);
-    if (!session) {
-      session = await sessionDb.transitionSession(conversation.id, 'first-message', {
-        ai_assistant_type: conversation.ai_assistant_type,
-      });
-    }
 
     // Reuse the config already loaded during workflow discovery (avoids a second disk read).
     // Fall back to loadConfig only when no codebase is scoped (discoveredConfig is undefined).
@@ -1280,6 +1276,32 @@ export async function handleMessage(
       }
     }
     const providerKey = chatRequest.provider;
+
+    // Get/create the active session AFTER the provider is resolved, so the
+    // session's ai_assistant_type always names the provider that mints (and
+    // owns) its assistant_session_id. A provider-specific session id is only
+    // resumable by the provider that created it — handing it to a different
+    // provider makes that provider --resume a session it never created (e.g.
+    // claude-terminal hangs on the "Resume session" picker). The resolved
+    // provider can now diverge from the conversation default via the user's
+    // default assistant or a cross-provider tier/alias, so on a provider change
+    // we transition to a fresh session bound to the new provider instead of
+    // threading the prior provider's session id forward.
+    let session = await sessionDb.getActiveSession(conversation.id);
+    if (!session) {
+      session = await sessionDb.transitionSession(conversation.id, 'first-message', {
+        ai_assistant_type: providerKey,
+      });
+    } else if (session.ai_assistant_type !== providerKey) {
+      getLog().info(
+        { conversationId, fromProvider: session.ai_assistant_type, toProvider: providerKey },
+        'session.provider_changed_reset'
+      );
+      session = await sessionDb.transitionSession(conversation.id, 'provider-changed', {
+        ai_assistant_type: providerKey,
+      });
+    }
+
     let dbEnvVars: Record<string, string> = {};
     if (conversation.codebase_id) {
       try {
@@ -2190,8 +2212,11 @@ async function handleRemoveProject(message: string): Promise<string> {
  * Binds the current conversation to a registered codebase by writing
  * `codebase_id` and `cwd` to the conversations table. Uses 4-tier fuzzy
  * name resolution (exact → case-insensitive → prefix → substring).
+ *
+ * `dbConversationId` MUST be the conversations-table UUID (conversation.id),
+ * not the platform/thread id — updateConversation matches on `WHERE id`.
  */
-async function handleSetProject(message: string, conversationId: string): Promise<string> {
+async function handleSetProject(message: string, dbConversationId: string): Promise<string> {
   const { args } = commandHandler.parseCommand(message);
   if (args.length < 1) {
     return 'Usage: /setproject <project-name>';
@@ -2214,13 +2239,13 @@ async function handleSetProject(message: string, conversationId: string): Promis
       : `Project "${projectName}" not found. No projects registered — use /register-project.`;
   }
 
-  await db.updateConversation(conversationId, {
+  await db.updateConversation(dbConversationId, {
     codebase_id: codebase.id,
     cwd: codebase.default_cwd,
   });
 
   getLog().info(
-    { conversationId, projectName: codebase.name, codebaseId: codebase.id },
+    { conversationId: dbConversationId, projectName: codebase.name, codebaseId: codebase.id },
     'project.set_completed'
   );
   return `Project set to **${codebase.name}**\nWorking directory: ${codebase.default_cwd}`;

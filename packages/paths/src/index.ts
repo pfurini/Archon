@@ -38,6 +38,9 @@ export {
 // Env loader
 export { loadArchonEnv, isVerboseBoot } from './env-loader';
 
+// Archon-internal-infra env denylist (mirror of stripCwdEnv)
+export { ARCHON_INTERNAL_ENV_KEYS, buildTargetCommandEnv } from './archon-internal-env';
+
 // Logger
 export { createLogger, setLogLevel, getLogLevel, rootLogger } from './logger';
 export type { Logger } from './logger';

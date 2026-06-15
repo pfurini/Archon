@@ -1,6 +1,12 @@
 import { describe, it, expect, beforeAll } from 'bun:test';
 
-import { ARCHON_EFFORT_LEVELS, EFFORT_MAPS, isArchonEffort, mapEffort } from './effort';
+import {
+  ARCHON_EFFORT_LEVELS,
+  DYNAMIC_CATALOG_EFFORT_PROVIDERS,
+  EFFORT_MAPS,
+  isArchonEffort,
+  mapEffort,
+} from './effort';
 import {
   clearRegistry,
   getRegisteredProviders,
@@ -63,6 +69,19 @@ describe('EFFORT_MAPS invariant vs ProviderCapabilities.effortControl', () => {
 
   it('every registered provider has effortControl === true ⇔ a non-null effort map', () => {
     for (const reg of getRegisteredProviders()) {
+      // Dynamic-catalog providers (e.g. cursor) advertise effortControl without a
+      // static EFFORT_MAPS row — their clamp is per-model + live-catalog driven.
+      if (DYNAMIC_CATALOG_EFFORT_PROVIDERS.has(reg.id)) {
+        expect(
+          reg.capabilities.effortControl,
+          `dynamic-catalog provider '${reg.id}' must advertise effortControl: true`
+        ).toBe(true);
+        expect(
+          EFFORT_MAPS[reg.id] ?? null,
+          `dynamic-catalog provider '${reg.id}' must NOT have a static EFFORT_MAPS row`
+        ).toBeNull();
+        continue;
+      }
       const hasMap = EFFORT_MAPS[reg.id] != null;
       expect(
         reg.capabilities.effortControl,

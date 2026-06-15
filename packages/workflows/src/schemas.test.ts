@@ -668,12 +668,16 @@ describe('SCRIPT_NODE_AI_FIELDS', () => {
 // ---------------------------------------------------------------------------
 
 describe('LOOP_NODE_AI_FIELDS', () => {
-  test('excludes model and provider (loop nodes support them)', () => {
-    expect(LOOP_NODE_AI_FIELDS).not.toContain('model');
-    expect(LOOP_NODE_AI_FIELDS).not.toContain('provider');
+  test('excludes the fields the executor forwards to each iteration', () => {
+    // model/provider (loop-level model selection) and effort/thinking (portable
+    // reasoning-depth knobs) all reach each iteration's sendQuery, so they must
+    // NOT be flagged as ignored.
+    for (const field of ['model', 'provider', 'effort', 'thinking']) {
+      expect(LOOP_NODE_AI_FIELDS).not.toContain(field);
+    }
   });
 
-  test('contains all other AI-specific fields from BASH_NODE_AI_FIELDS', () => {
+  test('contains the AI-specific fields that are genuinely no-ops on loops', () => {
     const expectedFields = [
       'context',
       'output_format',
@@ -682,8 +686,6 @@ describe('LOOP_NODE_AI_FIELDS', () => {
       'hooks',
       'mcp',
       'skills',
-      'effort',
-      'thinking',
       'maxBudgetUsd',
       'systemPrompt',
       'fallbackModel',

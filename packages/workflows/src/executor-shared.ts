@@ -59,6 +59,31 @@ export const TRANSIENT_PATTERNS = [
 ];
 
 /**
+ * Opaque provider error subtypes that carry no actionable detail in their
+ * message but represent a generic, recoverable provider-side failure. They are
+ * treated as retryable (TRANSIENT-equivalent) by the node retry layers — but
+ * ONLY after the FATAL message-pattern check wins, so an auth-flavored variant
+ * (e.g. `cursor_error — unauthorized`) is never retried.
+ *
+ * Currently just Cursor's catch-all `cursor_error` (incl. the bare `"run error"`
+ * case where the SDK returns an error-status final with no detail). Add other
+ * providers' generic-failure subtypes here as they are observed.
+ */
+export const OPAQUE_PROVIDER_ERROR_SUBTYPES: ReadonlySet<string> = new Set(['cursor_error']);
+
+/**
+ * Whether a provider's structural error `subtype` should be treated as a
+ * retryable (transient) failure. This is the structural counterpart to
+ * {@link classifyError}'s message-pattern matching: when a provider returns an
+ * opaque error-status final (no recoverable signal in the flattened message),
+ * the subtype is the only retryability hint available. FATAL precedence is
+ * preserved by the callers, which check FATAL message patterns first.
+ */
+export function isRetryableProviderErrorSubtype(subtype: string | undefined): boolean {
+  return subtype !== undefined && OPAQUE_PROVIDER_ERROR_SUBTYPES.has(subtype);
+}
+
+/**
  * Check if error message matches any pattern in the list.
  */
 export function matchesPattern(message: string, patterns: string[]): boolean {
