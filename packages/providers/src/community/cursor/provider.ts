@@ -209,6 +209,38 @@ function errorResult(message: string, subtype: string): MessageChunk {
   return { type: 'result', isError: true, errorSubtype: subtype, errors: [redactSecrets(message)] };
 }
 
+/**
+ * Cost-default fail-CLOSED gate, shared by the initial spawn AND the
+ * post-refresh retry. When the model can't be verified against the catalog the
+ * implicit `fast=false` (standard-tier) default can't be applied, so proceeding
+ * param-less makes the server bill at the premium (fast) tier. Block unless the
+ * user opted into premium-on-degraded.
+ *
+ * BOTH the first resolve and the retry-after-catalog-refresh MUST run this — a
+ * refresh that drops the model from the catalog would otherwise retry param-less
+ * and silently bill premium, bypassing the gate (Cursor Bugbot finding).
+ */
+function evaluateCostDefaultGate(
+  modelFound: boolean,
+  allowPremiumOnDegraded: boolean | undefined,
+  model: string,
+  log: ReturnType<typeof createLogger>
+): { blocked: true; message: string } | { blocked: false; degradedWarning?: string } {
+  if (modelFound) return { blocked: false };
+  if (!allowPremiumOnDegraded) {
+    log.warn({ model }, 'cursor.cost_default_unavailable');
+    return {
+      blocked: true,
+      message: `Cannot apply the standard-tier (fast=false) default for '${model}': the Cursor model catalog is unavailable (or does not list this model), so the run would bill at the premium (fast) tier. Restore catalog access, or set assistants.cursor.allowPremiumOnDegraded: true to proceed at premium tier.`,
+    };
+  }
+  return {
+    blocked: false,
+    degradedWarning:
+      'Cursor model catalog unavailable — proceeding without the standard-tier (fast=false) default. This run may bill at the premium (fast) tier.',
+  };
+}
+
 /** Load the Cursor model catalog. Default: {@link loadCursorCatalog}. */
 export type CursorCatalogLoader = (opts: {
   stateRoot: string;
@@ -389,25 +421,17 @@ export class CursorProvider implements IAgentProvider {
     let modelParams: ModelParameterValue[];
     try {
       const resolved = resolveCursorParams(catalog.models, model, knobs);
-      // Cost-default fail-CLOSED: if the model can't be verified against the
-      // catalog, the implicit `fast=false` default can't be applied — proceeding
-      // param-less makes the server bill at the premium (fast) tier. Block unless
-      // the user opted into premium-on-degraded (plan §3 degraded policy).
-      if (!resolved.modelFound) {
-        if (!cfg.allowPremiumOnDegraded) {
-          log.warn({ model }, 'cursor.cost_default_unavailable');
-          yield errorResult(
-            `Cannot apply the standard-tier (fast=false) default for '${model}': the Cursor model catalog is unavailable (or does not list this model), so the run would bill at the premium (fast) tier. Restore catalog access, or set assistants.cursor.allowPremiumOnDegraded: true to proceed at premium tier.`,
-            'cursor_model_params_unavailable'
-          );
-          return;
-        }
-        yield {
-          type: 'system',
-          content:
-            'Cursor model catalog unavailable — proceeding without the standard-tier (fast=false) default. This run may bill at the premium (fast) tier.',
-        };
+      const gate = evaluateCostDefaultGate(
+        resolved.modelFound,
+        cfg.allowPremiumOnDegraded,
+        model,
+        log
+      );
+      if (gate.blocked) {
+        yield errorResult(gate.message, 'cursor_model_params_unavailable');
+        return;
       }
+      if (gate.degradedWarning) yield { type: 'system', content: gate.degradedWarning };
       modelParams = resolved.params;
     } catch (err) {
       // An EXPLICIT knob the resolved model can't express → fail-loud, sidecar
@@ -483,14 +507,28 @@ export class CursorProvider implements IAgentProvider {
           return;
         }
         try {
-          const re = resolveCursorParams(catalog.models, model, knobs);
-          runnerCfg = { ...runnerCfg, modelParams: re.params };
-        } catch (re) {
-          if (re instanceof CursorModelParamsError) {
-            yield errorResult(re.message, 'cursor_model_params_unavailable');
+          const refreshed = resolveCursorParams(catalog.models, model, knobs);
+          // Reapply the SAME fail-closed cost gate as the first spawn: a refresh
+          // that dropped the model from the catalog must not retry param-less and
+          // bill premium just because the explicit-knob check (catch) didn't fire.
+          const gate = evaluateCostDefaultGate(
+            refreshed.modelFound,
+            cfg.allowPremiumOnDegraded,
+            model,
+            log
+          );
+          if (gate.blocked) {
+            yield errorResult(gate.message, 'cursor_model_params_unavailable');
             return;
           }
-          throw re;
+          if (gate.degradedWarning) yield { type: 'system', content: gate.degradedWarning };
+          runnerCfg = { ...runnerCfg, modelParams: refreshed.params };
+        } catch (reErr) {
+          if (reErr instanceof CursorModelParamsError) {
+            yield errorResult(reErr.message, 'cursor_model_params_unavailable');
+            return;
+          }
+          throw reErr;
         }
         // loop: retry once with the refreshed params
       }

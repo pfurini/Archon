@@ -769,5 +769,51 @@ describe('CursorProvider.sendQuery — model parameters', () => {
       expect(spawns()).toBe(1); // the create-time error surfaces, no retry
       expect(result(chunks)?.isError).toBe(true);
     });
+
+    it('reapplies the cost gate after a refresh DROPS the model — fails closed, no premium retry', async () => {
+      // Regression (Cursor Bugbot): the disk snapshot lists composer-1 (gate
+      // passes → first spawn), but the refresh drops it, so the retry can no
+      // longer verify the fast=false default. The retry MUST re-run the gate and
+      // block — not silently spawn param-less and bill at the premium tier.
+      const { spawnRunner, spawns } = makeRetryRunner({});
+      const { catalog, forceRefreshes } = makeFakeCatalog({
+        servedFromDisk: true,
+        refreshedModels: [{ id: 'gemini-3-flash', displayName: 'Gemini 3 Flash', parameters: [] }],
+      });
+      const provider = new CursorProvider({
+        resolveNodePath: () => '/fake/node',
+        spawnRunner,
+        loadCatalog: async () => catalog,
+      });
+      const chunks = await collect(provider.sendQuery('x', '/repo', undefined, BASE_OPTS));
+      expect(forceRefreshes()).toBe(1);
+      expect(spawns()).toBe(1); // only the first (rejected) spawn — premium retry blocked
+      expect(result(chunks)?.errorSubtype).toBe('cursor_model_params_unavailable');
+    });
+
+    it('with allowPremiumOnDegraded, a model dropped on refresh proceeds at premium with a visible warning', async () => {
+      const { spawnRunner, spawns } = makeRetryRunner({});
+      const { catalog } = makeFakeCatalog({
+        servedFromDisk: true,
+        refreshedModels: [{ id: 'gemini-3-flash', displayName: 'Gemini 3 Flash', parameters: [] }],
+      });
+      const provider = new CursorProvider({
+        resolveNodePath: () => '/fake/node',
+        spawnRunner,
+        loadCatalog: async () => catalog,
+      });
+      const chunks = await collect(
+        provider.sendQuery('x', '/repo', undefined, {
+          ...BASE_OPTS,
+          assistantConfig: { allowPremiumOnDegraded: true },
+        })
+      );
+      expect(spawns()).toBe(2); // opted in → the retry proceeds
+      const sys = chunks.find(c => c.type === 'system') as Extract<
+        MessageChunk,
+        { type: 'system' }
+      >;
+      expect(sys?.content).toMatch(/premium/i);
+    });
   });
 });
