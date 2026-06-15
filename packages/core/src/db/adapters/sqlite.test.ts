@@ -341,6 +341,65 @@ describe('SqliteAdapter', () => {
       expect(again).toEqual([{ n: 3 }]);
     });
   });
+
+  describe('user AI prefs table (per-user tiers/aliases/default)', () => {
+    test('remote_agent_user_ai_prefs exists and round-trips a row', async () => {
+      db = createTestDb();
+      // The table must be created on SQLite (the default DB) — not just Postgres —
+      // or getUserAiPrefs / `archon ai ... --scope user` hit "no such table".
+      await db.query(`INSERT INTO remote_agent_users (id) VALUES ('u1')`, []);
+      await db.query(
+        `INSERT INTO remote_agent_user_ai_prefs (id, user_id, tiers, aliases, default_provider)
+         VALUES ('p1', 'u1', $1, $2, $3)`,
+        [
+          '{"large":{"provider":"codex","model":"gpt-5.5"}}',
+          '{"@fast":{"provider":"claude"}}',
+          'codex',
+        ]
+      );
+      const rows = (await db.query(
+        `SELECT user_id, tiers, aliases, default_provider FROM remote_agent_user_ai_prefs`,
+        []
+      )) as {
+        rows: readonly {
+          user_id: string;
+          tiers: string;
+          aliases: string;
+          default_provider: string;
+        }[];
+      };
+      expect(rows.rows).toEqual([
+        {
+          user_id: 'u1',
+          tiers: '{"large":{"provider":"codex","model":"gpt-5.5"}}',
+          aliases: '{"@fast":{"provider":"claude"}}',
+          default_provider: 'codex',
+        },
+      ]);
+    });
+
+    test('UNIQUE(user_id) is enforced via ON CONFLICT upsert', async () => {
+      db = createTestDb();
+      await db.query(`INSERT INTO remote_agent_users (id) VALUES ('u1')`, []);
+      await db.query(
+        `INSERT INTO remote_agent_user_ai_prefs (id, user_id, default_provider)
+         VALUES ('p1', 'u1', 'claude')
+         ON CONFLICT (user_id) DO UPDATE SET default_provider = $2`,
+        ['u1', 'claude']
+      );
+      await db.query(
+        `INSERT INTO remote_agent_user_ai_prefs (id, user_id, default_provider)
+         VALUES ('p2', 'u1', 'codex')
+         ON CONFLICT (user_id) DO UPDATE SET default_provider = $2`,
+        ['u1', 'codex']
+      );
+      const rows = (await db.query(
+        `SELECT default_provider FROM remote_agent_user_ai_prefs WHERE user_id = 'u1'`,
+        []
+      )) as { rows: readonly { default_provider: string }[] };
+      expect(rows.rows).toEqual([{ default_provider: 'codex' }]);
+    });
+  });
 });
 
 function raw_pragma(dbPath: string, table: string): string[] {

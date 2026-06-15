@@ -407,6 +407,23 @@ export class SqliteAdapter implements IDatabase {
         UNIQUE(user_id, provider)
       );
 
+      -- Per-user AI preferences (Phase 3): personal model tiers/aliases +
+      -- default assistant. NON-encrypted — model names are not secrets (mirrors
+      -- codebase_env_vars, not the provider-key store). tiers/aliases are
+      -- JSON-as-TEXT (parsed in the store layer so SQLite and Postgres behave
+      -- identically). One row per user; cascades on user deletion. Mirrors the
+      -- Postgres definition in migrations/000_combined.sql.
+      CREATE TABLE IF NOT EXISTS remote_agent_user_ai_prefs (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+        user_id TEXT NOT NULL REFERENCES remote_agent_users(id) ON DELETE CASCADE,
+        tiers TEXT,
+        aliases TEXT,
+        default_provider TEXT,
+        created_at TEXT DEFAULT (datetime('now')),
+        updated_at TEXT DEFAULT (datetime('now')),
+        UNIQUE(user_id)
+      );
+
       -- Codebases table
       CREATE TABLE IF NOT EXISTS remote_agent_codebases (
         id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
