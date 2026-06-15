@@ -313,10 +313,16 @@ Add a one-line "Superseded by `cursor-node-sidecar.plan.md`" note at the top of
   in one DAG layer (shared `stateRoot`) → all succeed; `index.db` stays valid; resume each afterwards.
   Expect SQLite locking to serialize writes cleanly. If `SQLITE_BUSY` surfaces under load, confirm the
   store sets a `busy_timeout` (or add a small retry around `Agent.create`) — but corruption must not occur.
-- **G4b — Resume across worktree recreation:** create an agent in worktree A, remove A, recreate the
-  worktree at a (possibly different) path B, resume by the same `agentId` against the same stable
-  `stateRoot` → context recalled. Confirms `workspaceRef=cwd` changing does not break resume-by-id
-  (resume routes via `index.db` at the stable root, not the ephemeral cwd).
+- **G4b — Resume across worktree recreation:** ❌ **Disproven empirically (2026-06-15).** The §4b
+  assumption that resume "routes via `index.db` at the stable root, not the ephemeral cwd" is FALSE.
+  The `@cursor/sdk` keys `Agent.resume` by the agent's `local.cwd`: a changed cwd throws
+  `AgentNotFoundError` (`code: 'agent_not_found'`), and this is independent of `workspaceRef` (verified
+  with both `workspaceRef = cwd` and a constant `workspaceRef`). Even same-path teardown+recreate loses
+  recall. **Resume only works for sequential turns in the same persistent worktree (G3).** Archon's
+  worktree paths are deterministic per conversation/branch, so in-conversation resume is correct; cross
+  worktree-lifecycle resume is an SDK limitation, now documented in `ai-assistants.md`. The stable
+  `stateRoot` / SQLite choice remains correct — it is what makes G4 (concurrency) pass and persists the
+  store across process restarts; only the cross-cwd resume claim was wrong.
 - **G5 — Node-missing path:** simulate `Bun.which('node')` → null → `cursor_node_unavailable` result,
   process does not crash.
 - **G6 — `bun run validate`** green.

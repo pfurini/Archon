@@ -400,7 +400,7 @@ Phase 1 scope — flags reflect **wired** behavior (the dag-executor warns when 
 
 | Feature | Support | Notes |
 |---|---|---|
-| Session resume | ✅ | `sessionId` = the SDK `agentId`; resume reconstructs the agent against a stable `SqliteLocalAgentStore` under `~/.archon/cursor/store/` (the sidecar's `index.db` routes resume by `agentId`, not by cwd — so it survives worktree recreation) |
+| Session resume | ✅ (same worktree) | `sessionId` = the SDK `agentId`; the store is a stable `SqliteLocalAgentStore` under `~/.archon/cursor/store/` (one `index.db`, file-locked so parallel sidecar processes can't corrupt it). **Caveat:** the SDK keys resume by the agent's working directory — resume recalls prior context only when the run executes in the **same worktree path** it was created in (Archon's worktree paths are deterministic per conversation/branch, so sequential turns resume correctly). It does **not** survive a worktree being torn down and recreated. |
 | MCP servers | ✅ | `mcp: path/to/servers.json` → `AgentOptions.mcpServers` (env vars expanded from the request env) |
 | Structured output | ✅ best-effort | `output_format:` — schema appended to the prompt, JSON extracted + validated; re-asked up to 3× on a miss |
 | Sandbox | ✅ | `sandbox: true` → `LocalAgentOptions.sandboxOptions.enabled` |
