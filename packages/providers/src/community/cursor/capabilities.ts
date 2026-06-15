@@ -9,7 +9,8 @@ import type { ProviderCapabilities } from '../../types';
  * core text/tools/best-effort structured output + session resume + MCP +
  * sandbox.
  * - `sessionResume`: the SDK `agentId` is persisted as `result.sessionId`;
- *   resume reconstructs the agent against a stable JsonlLocalAgentStore root.
+ *   resume reconstructs the agent against a stable SqliteLocalAgentStore root
+ *   (the Node sidecar's `index.db` routes resume by agentId, not by cwd).
  * - `mcp`: node `mcp:` config file → `AgentOptions.mcpServers`.
  * - `sandbox`: node `sandbox` → `LocalAgentOptions.sandboxOptions.enabled`.
  * - `structuredOutput: 'best-effort'`: prompt-augment with the JSON schema +

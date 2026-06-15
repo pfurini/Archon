@@ -6,90 +6,99 @@ import { describe, expect, it } from 'bun:test';
 
 import type { MessageChunk, SendQueryOptions } from '../../types';
 
-import { CursorProvider } from './provider';
-import type { CursorSdkModule, CursorUsage, RunResult, SDKMessage } from './sdk-types';
+import {
+  CursorProvider,
+  type CursorProviderDeps,
+  type CursorRunnerConfig,
+  type CursorRunnerHandle,
+} from './provider';
+import type { CursorUsage, RunResult, SDKMessage } from './sdk-types';
 
-// ─── Fake @cursor/sdk ────────────────────────────────────────────────────────
+// ─── Fake Node sidecar (runner-spawn seam) ───────────────────────────────────
+//
+// The provider no longer loads `@cursor/sdk` in-process — it spawns a Node
+// sidecar that forwards raw SDKMessages as JSONL. These tests inject a fake
+// `spawnRunner` that yields scripted JSONL lines (the same shape `cursor-runner.mjs`
+// emits) so the pump is exercised with no real `node` / SDK.
 
 interface FakeCalls {
-  created: boolean;
-  resumedWith?: string;
-  options?: Record<string, unknown>;
-  sentPrompt?: string;
-  cancelled: boolean;
-  closed: boolean;
+  nodePath?: string;
+  cfg?: CursorRunnerConfig;
+  env?: Record<string, string | undefined>;
+  killed: boolean;
 }
 
-interface FakeSdkConfig {
+interface FakeRunnerConfig {
   messages: SDKMessage[];
+  /** Status carried on the terminal `final` line. */
   status?: RunResult['status'];
+  /** Usage carried on the terminal `final` line. */
   usage?: CursorUsage;
   agentId?: string;
-  /** Throw from Agent.create/resume (bad-key / config failure path). */
-  throwOnCreate?: Error;
-  /** Hook fired as each stream message is about to be yielded (for abort tests). */
+  /** Emit a single `{kind:'error'}` line instead of agent/msgs/final (child threw). */
+  errorLine?: string;
+  /** Omit the terminal `final` line (child died mid-stream). */
+  noFinal?: boolean;
+  exitCode?: number;
+  stderrTail?: string;
+  /** Fired before each `msg` line is yielded (index into `messages`). */
   onYield?: (index: number, calls: FakeCalls) => void;
 }
 
-function makeFakeSdk(cfg: FakeSdkConfig): { sdk: CursorSdkModule; calls: FakeCalls } {
-  const calls: FakeCalls = { created: false, cancelled: false, closed: false };
-  const agentId = cfg.agentId ?? 'agent-xyz';
+function makeFakeRunner(cfgR: FakeRunnerConfig): {
+  spawnRunner: NonNullable<CursorProviderDeps['spawnRunner']>;
+  calls: FakeCalls;
+} {
+  const calls: FakeCalls = { killed: false };
+  const agentId = cfgR.agentId ?? 'agent-xyz';
 
-  const makeRun = (onDelta?: (a: { update: { type: string; usage?: CursorUsage } }) => void) => {
-    if (cfg.usage && onDelta) onDelta({ update: { type: 'turn-ended', usage: cfg.usage } });
+  const spawnRunner = (
+    nodePath: string,
+    cfg: CursorRunnerConfig,
+    env: Record<string, string | undefined>
+  ): CursorRunnerHandle => {
+    calls.nodePath = nodePath;
+    calls.cfg = cfg;
+    calls.env = env;
+
+    async function* lines(): AsyncGenerator<string> {
+      await Promise.resolve(); // mirror the real async stdout stream
+      if (cfgR.errorLine !== undefined) {
+        yield JSON.stringify({ kind: 'error', message: cfgR.errorLine });
+        return;
+      }
+      yield JSON.stringify({ kind: 'agent', agentId });
+      for (let i = 0; i < cfgR.messages.length; i++) {
+        cfgR.onYield?.(i, calls);
+        if (calls.killed) return; // child killed (abort) → stop emitting
+        yield JSON.stringify({ kind: 'msg', message: cfgR.messages[i] });
+      }
+      if (!cfgR.noFinal) {
+        yield JSON.stringify({
+          kind: 'final',
+          status: cfgR.status ?? 'finished',
+          ...(cfgR.usage ? { usage: cfgR.usage } : {}),
+        });
+      }
+    }
+
     return {
-      id: 'run-1',
-      agentId,
-      async *stream(): AsyncGenerator<SDKMessage, void> {
-        await Promise.resolve(); // satisfy require-await; mirrors the real async stream
-        for (let i = 0; i < cfg.messages.length; i++) {
-          cfg.onYield?.(i, calls);
-          yield cfg.messages[i];
-        }
+      lines: lines(),
+      kill: () => {
+        calls.killed = true;
       },
-      async wait(): Promise<RunResult> {
-        return { id: 'run-1', status: cfg.status ?? 'finished' };
-      },
-      async cancel(): Promise<void> {
-        calls.cancelled = true;
-      },
+      exited: Promise.resolve({ exitCode: cfgR.exitCode ?? 0, stderrTail: cfgR.stderrTail ?? '' }),
     };
   };
 
-  const agent = {
-    agentId,
-    async send(
-      prompt: string,
-      opts: { onDelta?: (a: { update: { type: string; usage?: CursorUsage } }) => void }
-    ) {
-      calls.sentPrompt = prompt;
-      return makeRun(opts.onDelta);
-    },
-    close(): void {
-      calls.closed = true;
-    },
-  };
+  return { spawnRunner, calls };
+}
 
-  const Agent = {
-    async create(options: Record<string, unknown>) {
-      if (cfg.throwOnCreate) throw cfg.throwOnCreate;
-      calls.created = true;
-      calls.options = options;
-      return agent;
-    },
-    async resume(id: string, options: Record<string, unknown>) {
-      if (cfg.throwOnCreate) throw cfg.throwOnCreate;
-      calls.resumedWith = id;
-      calls.options = options;
-      return agent;
-    },
-  };
-
-  class JsonlLocalAgentStore {
-    constructor(public readonly root: string) {}
-  }
-
-  return { sdk: { Agent, JsonlLocalAgentStore } as unknown as CursorSdkModule, calls };
+/** Build a provider whose `node` resolves and whose sidecar is the fake runner. */
+function makeProvider(cfgR: FakeRunnerConfig): { provider: CursorProvider; calls: FakeCalls } {
+  const { spawnRunner, calls } = makeFakeRunner(cfgR);
+  const provider = new CursorProvider({ resolveNodePath: () => '/fake/node', spawnRunner });
+  return { provider, calls };
 }
 
 // ─── Message builders ────────────────────────────────────────────────────────
@@ -130,12 +139,11 @@ const BASE_OPTS: SendQueryOptions = { model: 'composer-1', env: { CURSOR_API_KEY
 
 describe('CursorProvider.sendQuery', () => {
   it('streams a coalesced text turn and a result with usage + sessionId=agentId', async () => {
-    const { sdk, calls } = makeFakeSdk({
+    const { provider, calls } = makeProvider({
       messages: [asst('Hel'), asst('lo'), asst(' there')],
       usage: { inputTokens: 50, outputTokens: 10, cacheReadTokens: 0, cacheWriteTokens: 0 },
       agentId: 'agent-abc',
     });
-    const provider = new CursorProvider({ loadSdk: async () => sdk });
     const chunks = await collect(provider.sendQuery('hi', '/repo', undefined, BASE_OPTS));
 
     expect(chunks).toEqual([
@@ -147,16 +155,19 @@ describe('CursorProvider.sendQuery', () => {
         stopReason: 'stop',
       },
     ]);
-    expect(calls.created).toBe(true);
-    expect(calls.closed).toBe(true);
-    // model + settingSources wired correctly.
-    const opts = calls.options as { model: { id: string }; local: { settingSources: string[] } };
-    expect(opts.model.id).toBe('composer-1');
-    expect(opts.local.settingSources).toEqual(['project']);
+    expect(calls.nodePath).toBe('/fake/node');
+    expect(calls.killed).toBe(true); // best-effort cleanup in finally
+    // model + settingSources + stateRoot + cwd forwarded in cfg.
+    expect(calls.cfg?.model).toBe('composer-1');
+    expect(calls.cfg?.settingSources).toEqual(['project']);
+    expect(calls.cfg?.cwd).toBe('/repo');
+    expect(calls.cfg?.stateRoot).toContain('cursor');
+    // CURSOR_API_KEY forwarded into the child env.
+    expect(calls.env?.CURSOR_API_KEY).toBe('test-key');
   });
 
   it('coalesces text across a tool boundary (text, tool, tool_result, text)', async () => {
-    const { sdk } = makeFakeSdk({
+    const { provider } = makeProvider({
       messages: [
         asst('Checking. '),
         asst('Now running.'),
@@ -165,7 +176,6 @@ describe('CursorProvider.sendQuery', () => {
         asst('Found it.'),
       ],
     });
-    const provider = new CursorProvider({ loadSdk: async () => sdk });
     const chunks = await collect(provider.sendQuery('go', '/repo', undefined, BASE_OPTS));
 
     expect(chunks).toEqual([
@@ -182,15 +192,14 @@ describe('CursorProvider.sendQuery', () => {
     ]);
   });
 
-  it('passes MCP servers (env-expanded) and sandbox into the agent options', async () => {
+  it('passes MCP servers (env-expanded) and sandbox into the runner cfg', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'cursor-mcp-'));
     const mcpPath = join(dir, 'mcp.json');
     writeFileSync(
       mcpPath,
       JSON.stringify({ mcpServers: { foo: { command: 'echo', env: { FLAG: '$FOO_FLAG' } } } })
     );
-    const { sdk, calls } = makeFakeSdk({ messages: [asst('ok')] });
-    const provider = new CursorProvider({ loadSdk: async () => sdk });
+    const { provider, calls } = makeProvider({ messages: [asst('ok')] });
     await collect(
       provider.sendQuery('x', dir, undefined, {
         ...BASE_OPTS,
@@ -198,44 +207,43 @@ describe('CursorProvider.sendQuery', () => {
         nodeConfig: { mcp: mcpPath, sandbox: true },
       })
     );
-    const opts = calls.options as {
-      mcpServers?: Record<string, { command?: string; env?: Record<string, string> }>;
-      local: { sandboxOptions?: { enabled: boolean } };
-    };
     // The shared loader env-expands the `env` field from requestOptions.env.
-    expect(opts.mcpServers?.foo).toMatchObject({ command: 'echo', env: { FLAG: '--enabled' } });
-    expect(opts.local.sandboxOptions).toEqual({ enabled: true });
+    expect(calls.cfg?.mcpServers?.foo).toMatchObject({
+      command: 'echo',
+      env: { FLAG: '--enabled' },
+    });
+    expect(calls.cfg?.sandbox).toBe(true);
   });
 
-  it('does not set sandboxOptions when sandbox is not requested', async () => {
-    const { sdk, calls } = makeFakeSdk({ messages: [asst('ok')] });
-    const provider = new CursorProvider({ loadSdk: async () => sdk });
+  it('does not set mcpServers/sandbox in cfg when not requested', async () => {
+    const { provider, calls } = makeProvider({ messages: [asst('ok')] });
     await collect(provider.sendQuery('x', '/repo', undefined, BASE_OPTS));
-    const opts = calls.options as { mcpServers?: unknown; local: { sandboxOptions?: unknown } };
-    expect(opts.local.sandboxOptions).toBeUndefined();
-    expect(opts.mcpServers).toBeUndefined();
+    expect(calls.cfg?.sandbox).toBeUndefined();
+    expect(calls.cfg?.mcpServers).toBeUndefined();
   });
 
-  it('resumes by agentId when a resumeSessionId is given', async () => {
-    const { sdk, calls } = makeFakeSdk({ messages: [asst('resumed')] });
-    const provider = new CursorProvider({ loadSdk: async () => sdk });
+  it('forwards resumeSessionId into the runner cfg when resuming', async () => {
+    const { provider, calls } = makeProvider({ messages: [asst('resumed')] });
     await collect(provider.sendQuery('again', '/repo', 'agent-prev', BASE_OPTS));
-    expect(calls.resumedWith).toBe('agent-prev');
-    expect(calls.created).toBe(false);
+    expect(calls.cfg?.resumeSessionId).toBe('agent-prev');
+  });
+
+  it('omits resumeSessionId from cfg on a fresh turn', async () => {
+    const { provider, calls } = makeProvider({ messages: [asst('fresh')] });
+    await collect(provider.sendQuery('start', '/repo', undefined, BASE_OPTS));
+    expect(calls.cfg?.resumeSessionId).toBeUndefined();
   });
 
   it('prepends a Shell workingDirectory directive (upstream SDK workaround) referencing the cwd', async () => {
-    const { sdk, calls } = makeFakeSdk({ messages: [asst('ok')] });
-    const provider = new CursorProvider({ loadSdk: async () => sdk });
+    const { provider, calls } = makeProvider({ messages: [asst('ok')] });
     await collect(provider.sendQuery('do the thing', '/work/dir', undefined, BASE_OPTS));
-    expect(calls.sentPrompt).toContain('workingDirectory');
-    expect(calls.sentPrompt).toContain('/work/dir');
-    expect(calls.sentPrompt).toContain('do the thing'); // original prompt preserved
+    expect(calls.cfg?.prompt).toContain('workingDirectory');
+    expect(calls.cfg?.prompt).toContain('/work/dir');
+    expect(calls.cfg?.prompt).toContain('do the thing'); // original prompt preserved
   });
 
   it('extracts best-effort structured output from accumulated text', async () => {
-    const { sdk } = makeFakeSdk({ messages: [asst('{"answer": '), asst('42}')] });
-    const provider = new CursorProvider({ loadSdk: async () => sdk });
+    const { provider } = makeProvider({ messages: [asst('{"answer": '), asst('42}')] });
     const opts: SendQueryOptions = {
       ...BASE_OPTS,
       outputFormat: {
@@ -249,29 +257,31 @@ describe('CursorProvider.sendQuery', () => {
     });
   });
 
-  it('yields a graceful result when the SDK cannot be loaded', async () => {
-    const provider = new CursorProvider({ loadSdk: async () => null });
+  it('yields cursor_node_unavailable when node is not on PATH', async () => {
+    const provider = new CursorProvider({
+      resolveNodePath: () => null,
+      spawnRunner: () => {
+        throw new Error('spawnRunner must not be called when node is missing');
+      },
+    });
     const chunks = await collect(provider.sendQuery('x', '/repo', undefined, BASE_OPTS));
     expect(chunks).toEqual([
       expect.objectContaining({
         type: 'result',
         isError: true,
-        errorSubtype: 'cursor_sdk_unavailable',
+        errorSubtype: 'cursor_node_unavailable',
       }),
     ]);
   });
 
   it('falls back to the default model when none is specified', async () => {
-    const { sdk, calls } = makeFakeSdk({ messages: [asst('ok')] });
-    const provider = new CursorProvider({ loadSdk: async () => sdk });
+    const { provider, calls } = makeProvider({ messages: [asst('ok')] });
     await collect(provider.sendQuery('x', '/repo', undefined, { env: { CURSOR_API_KEY: 'k' } }));
-    const opts = calls.options as { model: { id: string } };
-    expect(opts.model.id).toBe('composer-2.5');
+    expect(calls.cfg?.model).toBe('composer-2.5');
   });
 
   it('fails fast with cursor_auth_missing when no API key is available', async () => {
-    const { sdk } = makeFakeSdk({ messages: [] });
-    const provider = new CursorProvider({ loadSdk: async () => sdk });
+    const { provider } = makeProvider({ messages: [] });
     const saved = process.env.CURSOR_API_KEY;
     delete process.env.CURSOR_API_KEY;
     try {
@@ -290,29 +300,32 @@ describe('CursorProvider.sendQuery', () => {
     }
   });
 
-  it('emits an aborted result when the abort signal fires mid-stream', async () => {
+  it('emits a single aborted result when the abort signal fires mid-stream', async () => {
     const controller = new AbortController();
-    const { sdk, calls } = makeFakeSdk({
+    const { provider, calls } = makeProvider({
       messages: [asst('partial'), asst(' more'), asst(' tail')],
       onYield: index => {
         if (index === 1) controller.abort();
       },
     });
-    const provider = new CursorProvider({ loadSdk: async () => sdk });
     const chunks = await collect(
       provider.sendQuery('x', '/repo', undefined, { ...BASE_OPTS, abortSignal: controller.signal })
     );
-    const result = chunks.find(c => c.type === 'result');
-    expect(result).toMatchObject({ isError: true, errorSubtype: 'aborted', stopReason: 'aborted' });
-    expect(calls.cancelled).toBe(true);
+    const results = chunks.filter(c => c.type === 'result');
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({
+      isError: true,
+      errorSubtype: 'aborted',
+      stopReason: 'aborted',
+    });
+    expect(calls.killed).toBe(true); // parent killed the child
   });
 
-  it('yields a redacted cursor_error result when the SDK throws (bad key path)', async () => {
-    const { sdk } = makeFakeSdk({
+  it('yields a redacted cursor_error result when the sidecar emits an error line (bad key path)', async () => {
+    const { provider } = makeProvider({
       messages: [],
-      throwOnCreate: new Error('unauthenticated: Bearer sk-secret1234567'),
+      errorLine: 'unauthenticated: Bearer sk-secret1234567',
     });
-    const provider = new CursorProvider({ loadSdk: async () => sdk });
     const chunks = await collect(provider.sendQuery('x', '/repo', undefined, BASE_OPTS));
     const result = chunks.find(c => c.type === 'result') as Extract<
       MessageChunk,
@@ -322,5 +335,24 @@ describe('CursorProvider.sendQuery', () => {
     expect(result.errorSubtype).toBe('cursor_error');
     expect(result.errors?.[0]).toContain('[REDACTED]');
     expect(result.errors?.[0]).not.toContain('sk-secret');
+  });
+
+  it('yields cursor_error with the stderr tail when the sidecar dies without a final line', async () => {
+    const { provider } = makeProvider({
+      messages: [asst('partial work')],
+      noFinal: true,
+      exitCode: 1,
+      stderrTail: 'Cannot find module @cursor/sdk',
+    });
+    const chunks = await collect(provider.sendQuery('x', '/repo', undefined, BASE_OPTS));
+    // Buffered text is flushed before the error so partial output isn't lost.
+    expect(chunks.find(c => c.type === 'assistant')).toMatchObject({ content: 'partial work' });
+    const result = chunks.find(c => c.type === 'result') as Extract<
+      MessageChunk,
+      { type: 'result' }
+    >;
+    expect(result.isError).toBe(true);
+    expect(result.errorSubtype).toBe('cursor_error');
+    expect(result.errors?.[0]).toContain('Cannot find module');
   });
 });
