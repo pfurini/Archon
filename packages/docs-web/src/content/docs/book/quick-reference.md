@@ -183,6 +183,9 @@ Defined under `loop:` inside a node:
 | `max_iterations` | Yes | number | Maximum iterations before the node fails |
 | `fresh_context` | No | boolean | Start a new session each iteration (default: false) |
 | `until_bash` | No | string | Shell script run after each iteration; exit 0 signals completion |
+| `interactive` | No | boolean | Pause for user input after each iteration (requires `gate_message`) |
+| `gate_message` | No | string | Prompt shown at the interactive gate |
+| `escalate` | No | object | Switch to a stronger model when the loop stalls (no new commit for `stall_after` iterations). Fields: `model` (required, literal id), `provider`, `effort`, `stall_after` (default 3) |
 
 **Example:**
 

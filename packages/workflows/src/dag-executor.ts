@@ -2065,12 +2065,42 @@ async function executeScriptNode(
 }
 
 /**
+ * Read the current git HEAD commit hash for `cwd`, or null if unavailable.
+ *
+ * Used as the loop escalation progress signal: a per-cycle commit advances HEAD.
+ * Returns null (never throws) on a non-git cwd, a detached/empty repo, or any
+ * git failure, so the caller can degrade gracefully instead of crashing the loop.
+ * Kept as a small internal helper so the progress signal can later become
+ * pluggable (output changed, file mtime, …) without touching the loop logic.
+ */
+async function readGitHead(cwd: string): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync('git', ['-C', cwd, 'rev-parse', 'HEAD'], {
+      timeout: SUBPROCESS_DEFAULT_TIMEOUT,
+    });
+    const head = stdout.trim();
+    return head.length > 0 ? head : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Pre-resolved fallback provider/options for loop model-escalation (see `escalate`). */
+interface LoopEscalation {
+  provider: string;
+  options: SendQueryOptions | undefined;
+}
+
+/**
  * Execute a loop node — runs prompt repeatedly until completion signal or max iterations.
  *
  * Key behaviors:
  * - Returns NodeExecutionResult (not void) — DAG executor owns workflow lifecycle
  * - Receives upstream node outputs for $nodeId.output substitution
  * - Does not write current_step_index (DAG tracks per-node completion)
+ * - Optional escalate-on-stall: when `loop.escalate` is set and the loop makes no
+ *   progress (no new git commit) for `stall_after` consecutive iterations, swap to
+ *   the pre-resolved stronger fallback (`escalation`) for the remaining budget.
  */
 async function executeLoopNode(
   deps: WorkflowDeps,
@@ -2087,9 +2117,11 @@ async function executeLoopNode(
   docsDir: string,
   nodeOutputs: Map<string, NodeOutput>,
   config: WorkflowConfig,
-  issueContext?: string
+  issueContext?: string,
+  escalation?: LoopEscalation
 ): Promise<NodeExecutionResult> {
   const loop = node.loop;
+  const escalate = loop.escalate;
   const msgContext = { workflowId: workflowRun.id, nodeName: node.id };
 
   // Resolve AI client — fail fast with descriptive error
@@ -2135,6 +2167,98 @@ async function executeLoopNode(
   // message patterns are never retried; TRANSIENT patterns and opaque provider
   // subtypes (e.g. Cursor's `cursor_error`) are. Bounded by the same defaults.
   const iterationRetries = new Map<number, number>();
+
+  // §13.3 escalate-on-stall state. The active provider/client/options start as the
+  // primary and swap to the pre-resolved `escalation` fallback once the loop stalls.
+  let activeProvider = workflowProvider;
+  let activeClient = aiClient;
+  let activeOptions = resolvedOptions;
+  let escalated = false;
+  let stallCount = 0;
+
+  // Progress baseline (git HEAD). Only armed when `escalate` is configured AND the
+  // cwd is a usable git repo; otherwise stall detection stays off and the loop
+  // behaves exactly as today (escalation can still fire via (B)-retry exhaustion).
+  let stallDetectionEnabled = false;
+  let lastHead: string | null = null;
+  if (escalate) {
+    lastHead = await readGitHead(cwd);
+    if (lastHead) {
+      stallDetectionEnabled = true;
+    } else {
+      getLog().warn({ nodeId: node.id, cwd }, 'loop_node.stall_detection_unavailable');
+    }
+  }
+
+  // Swap the active provider/client/options to the pre-resolved fallback. Returns
+  // false (and changes nothing) when no fallback is available — the caller decides
+  // how to proceed. Records a `loop_node_escalated` DB event + user message so the
+  // §13.3 calibration loop (a separate process reading `workflow_events`) can see
+  // which waves needed escalation.
+  const escalateToFallback = async (
+    reason: 'stall' | 'retry_exhausted',
+    atIteration: number
+  ): Promise<boolean> => {
+    if (!escalation) return false;
+    let fallbackClient: ReturnType<typeof deps.getAgentProvider>;
+    try {
+      fallbackClient = deps.getAgentProvider(escalation.provider);
+    } catch (error) {
+      getLog().error(
+        { err: error as Error, nodeId: node.id, provider: escalation.provider },
+        'loop_node.escalation_provider_failed'
+      );
+      return false;
+    }
+    const fromProvider = activeProvider;
+    const fromModel = activeOptions?.model;
+    const toModel = escalation.options?.model;
+    activeProvider = escalation.provider;
+    activeOptions = escalation.options;
+    activeClient = fallbackClient;
+    escalated = true;
+    stallCount = 0;
+    // A cross-provider session can't resume — force a fresh session next iteration.
+    // (escalate targets fresh_context loops; this also covers fresh_context: false.)
+    currentSessionId = undefined;
+    getLog().warn(
+      {
+        nodeId: node.id,
+        fromProvider,
+        toProvider: activeProvider,
+        fromModel,
+        toModel,
+        atIteration,
+        reason,
+      },
+      'loop_node.escalated'
+    );
+    deps.store
+      .createWorkflowEvent({
+        workflow_run_id: workflowRun.id,
+        event_type: 'loop_node_escalated',
+        step_name: node.id,
+        data: {
+          nodeId: node.id,
+          fromProvider,
+          toProvider: activeProvider,
+          fromModel,
+          toModel,
+          atIteration,
+          reason,
+        },
+      })
+      .catch((err: Error) => {
+        logEventStoreError(err, atIteration);
+      });
+    await safeSendMessage(
+      platform,
+      conversationId,
+      `⏫ Loop \`${node.id}\` escalated to \`${activeProvider}\`${toModel ? ` (${toModel})` : ''} at iteration ${String(atIteration)} (reason: ${reason}).`,
+      msgContext
+    );
+    return true;
+  };
 
   for (let i = startIteration; i <= loop.max_iterations; i++) {
     const iterationStart = Date.now();
@@ -2223,11 +2347,11 @@ async function executeLoopNode(
       const finalPrompt = substituteNodeOutputRefs(substitutedPrompt, nodeOutputs);
 
       const iterationOptions: SendQueryOptions | undefined = {
-        ...resolvedOptions,
+        ...activeOptions,
         abortSignal: iterationAbortController.signal,
       };
 
-      const generator = aiClient.sendQuery(finalPrompt, cwd, resumeSessionId, iterationOptions);
+      const generator = activeClient.sendQuery(finalPrompt, cwd, resumeSessionId, iterationOptions);
       let lastToolStartedAt: { toolName: string; startedAt: number } | null = null;
 
       const effectiveIdleTimeout = node.idle_timeout ?? STEP_IDLE_TIMEOUT_MS;
@@ -2455,6 +2579,20 @@ async function executeLoopNode(
         await new Promise(resolve => setTimeout(resolve, delayMs));
         i--; // re-run this iteration (the for-loop's i++ restores the same index)
         continue;
+      }
+
+      // §2.4 (B)-exhaustion → escalate once instead of failing. We reach here with
+      // `iterationRetryable` true only after the per-iteration retries above are
+      // spent: the primary keeps erroring transiently, but the fallback provider
+      // may not share the outage. Re-run this iteration on the fallback (with a
+      // fresh retry budget). If already escalated, fall through to the failure.
+      if (iterationRetryable && escalate && !escalated) {
+        const swapped = await escalateToFallback('retry_exhausted', i);
+        if (swapped) {
+          iterationRetries.set(i, 0); // fallback gets its own retry budget
+          i--; // re-run this iteration on the fallback
+          continue;
+        }
       }
 
       return {
@@ -2747,6 +2885,53 @@ async function executeLoopNode(
         ...(loopTotalTokens !== undefined ? { tokens: loopTotalTokens } : {}),
         loopIterations: i,
       };
+    }
+
+    // §13.3 escalate-on-stall backstop. Reached only when this iteration neither
+    // completed nor paused — the loop is about to run another iteration. Measure
+    // progress (did git HEAD advance?) and escalate, or fail if already escalated.
+    if (escalate) {
+      if (stallDetectionEnabled) {
+        const headNow = await readGitHead(cwd);
+        if (headNow === null) {
+          // Transient git read failure mid-loop: do NOT treat as no-progress —
+          // counting it would push toward false escalation. Leave state unchanged.
+          getLog().warn({ nodeId: node.id, iteration: i }, 'loop_node.stall_head_read_skipped');
+        } else if (headNow !== lastHead) {
+          stallCount = 0;
+          lastHead = headNow;
+        } else {
+          stallCount++;
+        }
+      }
+
+      if (stallCount >= escalate.stall_after) {
+        if (!escalated) {
+          const swapped = await escalateToFallback('stall', i);
+          if (!swapped) {
+            // Fallback unavailable (shouldn't happen — pre-resolved at dispatch).
+            // Don't crash; let the loop run on to the max_iterations backstop.
+            getLog().error({ nodeId: node.id, iteration: i }, 'loop_node.escalation_unavailable');
+          }
+        } else {
+          // Already on the fallback and it ALSO stalled — fail rather than thrash
+          // the expensive model for the rest of the iteration budget.
+          const stalledMsg = `Loop node '${node.id}' escalated model also stalled (no progress for ${String(escalate.stall_after)} iterations, last at iteration ${String(i)})`;
+          getLog().warn(
+            { nodeId: node.id, iteration: i, stallAfter: escalate.stall_after },
+            'loop_node.escalated_stalled'
+          );
+          await safeSendMessage(platform, conversationId, stalledMsg, msgContext);
+          return {
+            state: 'failed',
+            output: lastIterationOutput,
+            error: stalledMsg,
+            costUsd: loopTotalCostUsd,
+            ...(loopTotalTokens !== undefined ? { tokens: loopTotalTokens } : {}),
+            loopIterations: i,
+          };
+        }
+      }
     }
   }
 
@@ -3283,6 +3468,46 @@ export async function executeDagWorkflow(
                 workflowPreset
               );
 
+            // Pre-resolve the escalation fallback (provider/model/options) here so
+            // resolution stays in one place and validates before the loop runs. The
+            // fallback's `model` is a literal (takes the isLiteralSpec branch — no
+            // model/provider-conflict warning). Per-node capability fields are
+            // stripped from the synthetic node so a never-escalating loop doesn't
+            // emit duplicate capability warnings for the fallback provider.
+            let escalation: LoopEscalation | undefined;
+            if (node.loop.escalate) {
+              const esc = node.loop.escalate;
+              const escalateSyntheticNode: DagNode = {
+                ...node,
+                provider: esc.provider ?? loopProvider,
+                model: esc.model,
+                ...(esc.effort ? { effort: esc.effort } : {}),
+                allowed_tools: undefined,
+                denied_tools: undefined,
+                hooks: undefined,
+                mcp: undefined,
+                skills: undefined,
+                agents: undefined,
+              };
+              const resolvedFallback = await resolveNodeProviderAndModel(
+                escalateSyntheticNode,
+                workflowProvider,
+                workflowModel,
+                config,
+                platform,
+                conversationId,
+                workflowRun.id,
+                cwd,
+                workflowLevelOptions,
+                aiProfile,
+                workflowPreset
+              );
+              escalation = {
+                provider: resolvedFallback.provider,
+                options: resolvedFallback.options,
+              };
+            }
+
             const output = await executeLoopNode(
               deps,
               platform,
@@ -3298,7 +3523,8 @@ export async function executeDagWorkflow(
               docsDir,
               nodeOutputs,
               config,
-              issueContext
+              issueContext,
+              escalation
             );
             return { nodeId: node.id, output, provider: loopProvider };
           }

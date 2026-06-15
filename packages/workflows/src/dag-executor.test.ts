@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, mock, spyOn, type Mock } f
 import { mkdir, writeFile, rm, readFile } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { execFileSync } from 'node:child_process';
 import * as git from '@archon/git';
 
 // --- Mock logger (MUST come before imports of modules under test) ---
@@ -2876,6 +2877,371 @@ describe('executeDagWorkflow -- opaque provider-error retry (cursor_error)', () 
     expect(callCount).toBe(1);
     expect(mockDeps.store.failWorkflowRun as ReturnType<typeof mock>).toHaveBeenCalled();
   });
+});
+
+describe('executeDagWorkflow -- loop model-escalation on stall', () => {
+  let testDir: string;
+
+  // Distinct per-provider sendQuery spies so a test can assert the FALLBACK
+  // client was actually used after escalation (the primary stays on 'claude').
+  let primarySend: ReturnType<typeof mock>;
+  let fallbackSend: ReturnType<typeof mock>;
+
+  /** Make an empty commit on `testDir` to advance HEAD (the loop progress signal). */
+  function commitInTestDir(msg: string): void {
+    execFileSync(
+      'git',
+      [
+        '-C',
+        testDir,
+        '-c',
+        'user.email=t@t',
+        '-c',
+        'user.name=t',
+        'commit',
+        '--allow-empty',
+        '-m',
+        msg,
+      ],
+      { stdio: 'ignore' }
+    );
+  }
+
+  beforeEach(async () => {
+    testDir = join(
+      tmpdir(),
+      `dag-loop-escalate-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    await mkdir(testDir, { recursive: true });
+    mockLogFn.mockClear();
+    mockSendQueryDag.mockClear();
+    mockGetAgentProviderDag.mockClear();
+    primarySend = mock(function* () {
+      yield { type: 'assistant', content: 'working...' };
+      yield { type: 'result', sessionId: 'primary' };
+    });
+    fallbackSend = mock(function* () {
+      yield { type: 'assistant', content: 'All done! <promise>COMPLETE</promise>' };
+      yield { type: 'result', sessionId: 'fallback' };
+    });
+    // Provider-aware: 'claude-terminal' → fallback client; anything else → primary.
+    mockGetAgentProviderDag.mockImplementation((provider: string) =>
+      provider === 'claude-terminal'
+        ? {
+            sendQuery: fallbackSend,
+            getType: () => 'claude-terminal',
+            getCapabilities: mockClaudeCapabilities,
+          }
+        : {
+            sendQuery: primarySend,
+            getType: () => 'claude',
+            getCapabilities: mockClaudeCapabilities,
+          }
+    );
+  });
+
+  afterEach(async () => {
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    }));
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup errors
+    }
+  });
+
+  /** Count loop_node_escalated DB events recorded on a store mock. */
+  function escalationEvents(store: IWorkflowStore): Record<string, unknown>[] {
+    return (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls
+      .map((c: unknown[]) => c[0] as Record<string, unknown>)
+      .filter(e => e.event_type === 'loop_node_escalated');
+  }
+
+  function escalateNode(stallAfter: number, maxIterations = 10): DagNode {
+    return {
+      id: 'impl-loop',
+      loop: {
+        prompt: 'Do work.',
+        until: 'COMPLETE',
+        max_iterations: maxIterations,
+        fresh_context: true,
+        escalate: {
+          provider: 'claude-terminal',
+          model: 'opus',
+          effort: 'high',
+          stall_after: stallAfter,
+        },
+      },
+    } as DagNode;
+  }
+
+  it('escalates to the fallback when the loop stalls (no new commit)', async () => {
+    execFileSync('git', ['-C', testDir, 'init'], { stdio: 'ignore' });
+    commitInTestDir('baseline');
+
+    // Primary commits on its first 2 iterations (progress), then stops (stall).
+    let primaryCalls = 0;
+    primarySend = mock(function* () {
+      primaryCalls++;
+      if (primaryCalls <= 2) commitInTestDir(`c${String(primaryCalls)}`);
+      yield { type: 'assistant', content: 'working...' };
+      yield { type: 'result', sessionId: 'primary' };
+    });
+
+    const mockStore = createMockStore();
+    const mockDeps = createMockDeps(mockStore);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('dag-loop-escalate-run');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-loop-escalate',
+      testDir,
+      { name: 'dag-loop-escalate', nodes: [escalateNode(2)] },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const events = escalationEvents(mockStore);
+    expect(events.length).toBe(1);
+    expect((events[0].data as Record<string, unknown>).reason).toBe('stall');
+    expect((events[0].data as Record<string, unknown>).toProvider).toBe('claude-terminal');
+    // The fallback client ran at least once after escalation, and the run completed.
+    expect(fallbackSend).toHaveBeenCalled();
+    expect(mockStore.completeWorkflowRun as ReturnType<typeof mock>).toHaveBeenCalled();
+    expect(mockStore.failWorkflowRun as ReturnType<typeof mock>).not.toHaveBeenCalled();
+  }, 15_000);
+
+  it('does NOT escalate a healthy loop that commits every iteration', async () => {
+    execFileSync('git', ['-C', testDir, 'init'], { stdio: 'ignore' });
+    commitInTestDir('baseline');
+
+    // Commits every iteration (always progressing); completes on iteration 5 —
+    // well past stall_after, but never stalls, so it must NOT escalate.
+    let primaryCalls = 0;
+    primarySend = mock(function* () {
+      primaryCalls++;
+      commitInTestDir(`c${String(primaryCalls)}`);
+      if (primaryCalls >= 5) {
+        yield { type: 'assistant', content: 'Done <promise>COMPLETE</promise>' };
+      } else {
+        yield { type: 'assistant', content: 'still working...' };
+      }
+      yield { type: 'result', sessionId: 'primary' };
+    });
+
+    const mockStore = createMockStore();
+    const mockDeps = createMockDeps(mockStore);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('dag-loop-healthy-run');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-loop-healthy',
+      testDir,
+      { name: 'dag-loop-healthy', nodes: [escalateNode(2)] },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(escalationEvents(mockStore).length).toBe(0);
+    expect(fallbackSend).not.toHaveBeenCalled();
+    expect(mockStore.completeWorkflowRun as ReturnType<typeof mock>).toHaveBeenCalled();
+  }, 15_000);
+
+  it('fails the loop when the escalated model also stalls', async () => {
+    execFileSync('git', ['-C', testDir, 'init'], { stdio: 'ignore' });
+    commitInTestDir('baseline');
+
+    // Primary commits twice then stalls → escalates. Fallback never commits and
+    // never completes → after stall_after more no-progress iterations it fails.
+    let primaryCalls = 0;
+    primarySend = mock(function* () {
+      primaryCalls++;
+      if (primaryCalls <= 2) commitInTestDir(`c${String(primaryCalls)}`);
+      yield { type: 'assistant', content: 'working...' };
+      yield { type: 'result', sessionId: 'primary' };
+    });
+    fallbackSend = mock(function* () {
+      yield { type: 'assistant', content: 'still grinding, no commit' };
+      yield { type: 'result', sessionId: 'fallback' };
+    });
+
+    const mockStore = createMockStore();
+    const mockDeps = createMockDeps(mockStore);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('dag-loop-double-stall-run');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-loop-double-stall',
+      testDir,
+      { name: 'dag-loop-double-stall', nodes: [escalateNode(2)] },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // Escalated exactly once (stall), then failed when the fallback also stalled.
+    expect(escalationEvents(mockStore).length).toBe(1);
+    expect(fallbackSend).toHaveBeenCalled();
+    expect(mockStore.failWorkflowRun as ReturnType<typeof mock>).toHaveBeenCalled();
+    const stalledMsg = (platform.sendMessage as ReturnType<typeof mock>).mock.calls.some(
+      (c: unknown[]) =>
+        typeof c[1] === 'string' && (c[1] as string).includes('escalated model also stalled')
+    );
+    expect(stalledMsg).toBe(true);
+  }, 20_000);
+
+  it('composes with the (B) per-iteration retry without counting it as a stall', async () => {
+    execFileSync('git', ['-C', testDir, 'init'], { stdio: 'ignore' });
+    commitInTestDir('baseline');
+
+    // Iteration 1 errors transiently once (retried on the SAME model), then every
+    // completed iteration commits and the loop completes on iteration 2. A
+    // transient-retry must not escalate.
+    let primaryCalls = 0;
+    primarySend = mock(function* () {
+      primaryCalls++;
+      if (primaryCalls === 1) {
+        yield {
+          type: 'result',
+          isError: true,
+          errorSubtype: 'cursor_error',
+          errors: ['run error'],
+        };
+        return;
+      }
+      commitInTestDir(`c${String(primaryCalls)}`);
+      yield { type: 'assistant', content: 'Done <promise>COMPLETE</promise>' };
+      yield { type: 'result', sessionId: 'primary' };
+    });
+
+    const mockStore = createMockStore();
+    const mockDeps = createMockDeps(mockStore);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('dag-loop-compose-run');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-loop-compose',
+      testDir,
+      { name: 'dag-loop-compose', nodes: [escalateNode(2)] },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(escalationEvents(mockStore).length).toBe(0);
+    expect(fallbackSend).not.toHaveBeenCalled();
+    expect(mockStore.completeWorkflowRun as ReturnType<typeof mock>).toHaveBeenCalled();
+  }, 15_000);
+
+  it('escalates once when the primary exhausts its per-iteration retries (§2.4)', async () => {
+    execFileSync('git', ['-C', testDir, 'init'], { stdio: 'ignore' });
+    commitInTestDir('baseline');
+
+    // Primary always errors with an opaque (retryable) cursor_error. Once the
+    // per-iteration retries are spent, the loop escalates to the fallback — which
+    // completes. Escalation here is retry-driven, not stall-driven (no commits).
+    primarySend = mock(function* () {
+      yield { type: 'result', isError: true, errorSubtype: 'cursor_error', errors: ['run error'] };
+    });
+
+    const mockStore = createMockStore();
+    const mockDeps = createMockDeps(mockStore);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('dag-loop-retry-escalate-run');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-loop-retry-escalate',
+      testDir,
+      { name: 'dag-loop-retry-escalate', nodes: [escalateNode(2)] },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const events = escalationEvents(mockStore);
+    expect(events.length).toBe(1);
+    expect((events[0].data as Record<string, unknown>).reason).toBe('retry_exhausted');
+    expect(fallbackSend).toHaveBeenCalled();
+    expect(mockStore.completeWorkflowRun as ReturnType<typeof mock>).toHaveBeenCalled();
+    expect(mockStore.failWorkflowRun as ReturnType<typeof mock>).not.toHaveBeenCalled();
+  }, 25_000);
+
+  it('disables stall detection (no crash) when the cwd is not a git repo', async () => {
+    // testDir exists but is NOT a git repo → readGitHead returns null → stall
+    // detection off (warn). The loop still runs and completes via the signal.
+    primarySend = mock(function* () {
+      yield { type: 'assistant', content: 'Done <promise>COMPLETE</promise>' };
+      yield { type: 'result', sessionId: 'primary' };
+    });
+
+    const mockStore = createMockStore();
+    const mockDeps = createMockDeps(mockStore);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('dag-loop-nogit-run');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-loop-nogit',
+      testDir,
+      { name: 'dag-loop-nogit', nodes: [escalateNode(2)] },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(escalationEvents(mockStore).length).toBe(0);
+    expect(mockStore.completeWorkflowRun as ReturnType<typeof mock>).toHaveBeenCalled();
+    const warned = mockLogFn.mock.calls.some(
+      (c: unknown[]) => c[1] === 'loop_node.stall_detection_unavailable'
+    );
+    expect(warned).toBe(true);
+  }, 15_000);
 });
 
 describe('executeDagWorkflow -- tool_called event persistence', () => {

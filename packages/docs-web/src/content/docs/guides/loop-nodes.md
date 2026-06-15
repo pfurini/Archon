@@ -158,6 +158,48 @@ double-quoting footgun that applies to `bash:` nodes applies here — see
 [Shell Quoting in `bash:` vs `script:`](/reference/variables#shell-quoting-in-bash-vs-script)
 for the unquoted idiom to use.
 
+### `escalate`
+
+Optional capability backstop: switch to a stronger fallback model when the loop
+**stalls** — makes no progress for `stall_after` consecutive iterations — instead
+of burning the whole `max_iterations` budget on a model that can't finish.
+
+```yaml
+loop:
+  prompt: "Implement the next story, validate, commit."
+  until: COMPLETE
+  max_iterations: 15
+  fresh_context: true
+  escalate:
+    provider: claude-terminal   # optional; defaults to the loop's current provider
+    model: opus                 # required; a LITERAL model id, not a tier keyword
+    effort: high                # optional; low | medium | high | max
+    stall_after: 3              # optional; consecutive no-progress iterations (default 3)
+```
+
+How it works:
+
+- **Progress signal (v1):** a new git commit in the loop's working directory.
+  Most code loops commit once per cycle, so a stalled loop is one that commits
+  nothing for `stall_after` completed iterations. The signal is per–working
+  directory, not per-node: a sibling DAG node committing to the same checkout
+  would read as progress.
+- **One escalation:** on the first stall the loop swaps to the fallback and resets
+  its stall counter. If the fallback **also** stalls for `stall_after` iterations,
+  the loop fails with a clear error rather than thrashing the expensive model.
+- **Composes with retries:** a transient provider error that the per-iteration
+  retry recovers from is **not** counted as a stall. If those retries are
+  exhausted, the loop escalates once (the fallback provider may not share the
+  outage) before failing.
+- **Graceful degradation:** if the working directory is not a git repository,
+  stall detection is disabled (with a warning) and the loop behaves as if
+  `escalate` were unset — it never crashes on a git error.
+
+`escalate` is intended for `fresh_context: true` loops: switching provider
+mid-loop starts a fresh session (a cross-provider session can't resume), so each
+iteration must re-read its state from disk. `max_iterations` remains the hard cap
+across both models.
+
 ## Patterns
 
 ### Stateless agent (Ralph pattern)
