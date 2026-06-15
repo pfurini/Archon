@@ -542,6 +542,11 @@ export class CursorProvider implements IAgentProvider {
     let yieldedContent = false;
     let capturedUsage: CursorUsage | undefined;
     let errorMessage: string | undefined;
+    // An error-status `final` is finalized AFTER the loop, once `handle.exited`
+    // has resolved the sidecar's stderr tail — the SDK's RunResult carries no
+    // detail on error, so the tail is the only diagnostic. A `finished` final is
+    // finalized inline (no stderr needed) so success has zero added latency.
+    let errorFinal: { result: RunResult; structuredOutput: unknown } | undefined;
 
     try {
       for await (const line of handle.lines) {
@@ -574,13 +579,18 @@ export class CursorProvider implements IAgentProvider {
               status: parsed.status,
               ...(parsed.result !== undefined ? { result: parsed.result } : {}),
             };
-            for (const chunk of finalizeResult(state, {
-              result,
-              sessionId: state.sessionId ?? '',
-              usage: capturedUsage,
-              structuredOutput,
-            })) {
-              yield chunk;
+            if (parsed.status === 'finished') {
+              for (const chunk of finalizeResult(state, {
+                result,
+                sessionId: state.sessionId ?? '',
+                usage: capturedUsage,
+                structuredOutput,
+              })) {
+                yield chunk;
+              }
+            } else {
+              // Defer: finalize with the stderr tail once `handle.exited` resolves.
+              errorFinal = { result, structuredOutput };
             }
             break;
           }
@@ -591,6 +601,25 @@ export class CursorProvider implements IAgentProvider {
       }
 
       const { exitCode, stderrTail } = await handle.exited;
+
+      // Error-status `final`: finalize now, threading the captured stderr tail so
+      // the SDK's own reason surfaces instead of a bare `run error`.
+      if (errorFinal) {
+        for (const chunk of finalizeResult(state, {
+          result: errorFinal.result,
+          sessionId: state.sessionId ?? '',
+          usage: capturedUsage,
+          structuredOutput: errorFinal.structuredOutput,
+          stderrTail,
+        })) {
+          yield chunk;
+        }
+        log.error(
+          { sessionId: state.sessionId, status: errorFinal.result.status, exitCode },
+          'cursor.turn_failed'
+        );
+        return;
+      }
 
       // A terminal `final` is the authoritative end of the turn: if it was
       // emitted, the run completed before/around the abort, so don't also emit an

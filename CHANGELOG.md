@@ -29,6 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Cursor run failures now surface the SDK's actual error instead of a bare `run error`.**
+  When `@cursor/sdk` returns an error-status run with no result detail, the provider now threads
+  the sidecar's captured stderr tail (where the SDK logs the real reason — rate limit, tool failure,
+  upstream overload) into the result, so the failure is diagnosable from logs instead of an opaque
+  `cursor_error — run error`. Error-status finals are finalized after the sidecar exits so the tail
+  is available; successful runs are unaffected (finalized inline, zero added latency).
+
 - **DAG nodes no longer silently complete when `idle_timeout` fires before any output is produced.**
   Previously, an idle timeout with zero output was incorrectly recorded as `completed`. Now it fails
   with a clear error: `"Node '<id>' timed out with no output … Consider increasing idle_timeout or

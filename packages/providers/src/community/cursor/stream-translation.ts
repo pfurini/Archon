@@ -159,12 +159,28 @@ export function finalizeResult(
     sessionId: string;
     usage: CursorUsage | undefined;
     structuredOutput?: unknown;
+    /**
+     * Bounded, redacted tail of the sidecar's stderr. On an error-status `final`
+     * the SDK's own RunResult carries no detail (`result` is empty), so without
+     * this the error degrades to a useless `run error`. The tail is where
+     * `@cursor/sdk` logs the real reason (rate limit, tool failure, overload),
+     * so it's the fallback detail just below an explicit result string. Only
+     * consulted for error results.
+     */
+    stderrTail?: string;
   }
 ): MessageChunk[] {
   const chunks = flushText(state);
   const status = params.result.status;
   const isError = status !== 'finished' || state.nonTerminalError !== undefined;
   const stopReason = status === 'finished' ? 'stop' : status;
+
+  // Pick the most informative non-empty detail. The SDK frequently returns an
+  // error status with an EMPTY `result`, so fall through to the captured stderr
+  // tail before the bare `run <status>` placeholder.
+  const resultText = params.result.result?.trim() ? params.result.result : undefined;
+  const stderrText = params.stderrTail?.trim() ? params.stderrTail.trim() : undefined;
+  const errorDetail = state.nonTerminalError ?? resultText ?? stderrText ?? `run ${status}`;
 
   const result: MessageChunk = {
     type: 'result',
@@ -176,9 +192,7 @@ export function finalizeResult(
       ? {
           isError: true,
           errorSubtype: 'cursor_error',
-          errors: [
-            redactSecrets(state.nonTerminalError ?? params.result.result ?? `run ${status}`),
-          ],
+          errors: [redactSecrets(errorDetail)],
         }
       : {}),
   };

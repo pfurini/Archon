@@ -466,6 +466,30 @@ describe('CursorProvider.sendQuery', () => {
     ]);
   });
 
+  it('surfaces the stderr tail on an error-status final (instead of a bare "run error")', async () => {
+    // The SDK can return a clean `final` with status:'error' and NO result detail
+    // (observed in prod as errors:["run error"]). The captured stderr tail — where
+    // @cursor/sdk logs the real reason — must be threaded into the error result.
+    const { provider } = makeProvider({
+      messages: [asst('partial work')],
+      status: 'error',
+      stderrTail: '[sdk] run failed: upstream model overloaded (503)',
+    });
+    const chunks = await collect(provider.sendQuery('x', '/repo', undefined, BASE_OPTS));
+    const r = result(chunks);
+    expect(r?.isError).toBe(true);
+    expect(r?.errorSubtype).toBe('cursor_error');
+    expect(r?.errors?.[0]).toContain('upstream model overloaded (503)');
+    expect(r?.errors?.[0]).not.toBe('run error');
+    expect(r?.stopReason).toBe('error');
+  });
+
+  it('degrades to "run error" on an error-status final when the stderr tail is empty', async () => {
+    const { provider } = makeProvider({ messages: [asst('x')], status: 'error', stderrTail: '' });
+    const chunks = await collect(provider.sendQuery('x', '/repo', undefined, BASE_OPTS));
+    expect(result(chunks)?.errors?.[0]).toBe('run error');
+  });
+
   it('yields cursor_error with the stderr tail when the sidecar dies without a final line', async () => {
     const { provider } = makeProvider({
       messages: [asst('partial work')],

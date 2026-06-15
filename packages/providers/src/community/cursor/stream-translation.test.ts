@@ -208,4 +208,43 @@ describe('finalizeResult', () => {
       errors: ['aborted by user'],
     });
   });
+
+  it('falls back to the stderr tail when an error run has no result detail', () => {
+    const state = makeTranslationState();
+    const chunks = finalizeResult(state, {
+      result: { id: RID, status: 'error' }, // empty result — the SDK gives no detail
+      sessionId: AID,
+      usage: undefined,
+      stderrTail: '[sdk] rate limit exceeded (429); retry later',
+    });
+    expect(chunks.find(c => c.type === 'result')).toMatchObject({
+      isError: true,
+      errorSubtype: 'cursor_error',
+      errors: ['[sdk] rate limit exceeded (429); retry later'],
+    });
+  });
+
+  it('prefers an explicit result string over the stderr tail', () => {
+    const state = makeTranslationState();
+    const chunks = finalizeResult(state, {
+      result: { id: RID, status: 'error', result: 'authoritative reason' },
+      sessionId: AID,
+      usage: undefined,
+      stderrTail: 'noisy [sdk] tail',
+    });
+    expect(chunks.find(c => c.type === 'result')).toMatchObject({
+      errors: ['authoritative reason'],
+    });
+  });
+
+  it('still degrades to `run <status>` when neither result nor stderr tail is present', () => {
+    const state = makeTranslationState();
+    const chunks = finalizeResult(state, {
+      result: { id: RID, status: 'error' },
+      sessionId: AID,
+      usage: undefined,
+      stderrTail: '   ', // whitespace-only → treated as absent
+    });
+    expect(chunks.find(c => c.type === 'result')).toMatchObject({ errors: ['run error'] });
+  });
 });
