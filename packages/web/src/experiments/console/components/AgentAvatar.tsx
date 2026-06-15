@@ -7,7 +7,7 @@ interface AgentAvatarProps {
 /**
  * 30px gradient-ring avatar for assistant messages. Ring + punched inner
  * circle mirror the design handoff's `chat-icons.jsx:23-41`; the mark inside
- * is the real Archon shield logo (`/favicon.png`, same asset as the console
+ * is the real FuriAI lightning-F logo (`/favicon.png`, same asset as the console
  * topbar) instead of the handoff's placeholder triangle. SVG `linearGradient`
  * cannot read CSS custom props reliably, so brand stops are hard-coded —
  * same trade-off the handoff takes.

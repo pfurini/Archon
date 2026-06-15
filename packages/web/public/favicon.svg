@@ -1,0 +1,27 @@
+<svg width="400" height="400" viewBox="0 0 400 400" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="g" x1="150" y1="70" x2="190" y2="372" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#ED10EC"/>
+      <stop offset="0.5" stop-color="#8E40C8"/>
+      <stop offset="1" stop-color="#06CE94"/>
+    </linearGradient>
+  </defs>
+  <g transform="translate(8,0) skewX(-7)">
+    <path fill="url(#g)" d="
+      M132 72
+      L320 72
+      L300 120
+      L188 120
+      L188 175
+      L262 175
+      L244 223
+      L188 223
+      L188 250
+      L168 300
+      L210 300
+      L150 372
+      L132 320
+      L132 72
+      Z"/>
+  </g>
+</svg>
