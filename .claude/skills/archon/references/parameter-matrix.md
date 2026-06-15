@@ -25,8 +25,9 @@ There are seven node types. Exactly one of `command`, `prompt`, `bash`, `script`
 | `skills`                                     | yes     | yes     | ignored | ignored | ignored                      | ignored        | ignored |
 | `agents`                                     | yes     | yes     | ignored | ignored | ignored                      | ignored        | ignored |
 | `retry`                                      | yes     | yes     | yes     | yes     | **hard error**               | yes (`on_reject`) | yes  |
-| `effort` (portable; provider-mapped — see Providers table) | yes | yes | ignored | ignored | ignored | ignored | ignored |
-| `thinking` / `fallbackModel` / `betas` / `sandbox` / `maxBudgetUsd` / `systemPrompt` (Claude SDK) | yes | yes | ignored | ignored | ignored | ignored | ignored |
+| `effort` (portable; provider-mapped — see Providers table) | yes | yes | ignored | ignored | **yes** (forwarded per iteration) | ignored | ignored |
+| `thinking` (Claude SDK reasoning)            | yes     | yes     | ignored | ignored | **yes** (forwarded per iteration) | ignored | ignored |
+| `fallbackModel` / `betas` / `sandbox` / `maxBudgetUsd` / `systemPrompt` (Claude SDK) | yes | yes | ignored | ignored | ignored | ignored | ignored |
 | `bash` / `script` / `runtime` / `deps`       | —       | —       | `bash` required | `script` + `runtime` required | —            | —              | —       |
 | `loop` (nested config)                       | —       | —       | —       | —       | **required**                 | —              | —       |
 | `approval` (nested config)                   | —       | —       | —       | —       | —                            | **required**   | —       |
@@ -37,7 +38,7 @@ There are seven node types. Exactly one of `command`, `prompt`, `bash`, `script`
 - **ignored** — field is accepted by the parser but has no effect at runtime. Loader emits a warning (`<node-type>_node_ai_fields_ignored`).
 - **hard error** — workflow fails to load. Only `retry` on a loop node does this.
 
-Most AI features work on `command` and `prompt` nodes. Loop nodes are thin controllers — the AI fields inside `loop.prompt` are what actually run — **except `model` and `provider`, which the executor resolves at the loop-node level and forwards to every iteration's AI call.** `bash` and `script` nodes silently ignore AI fields. `approval` and `cancel` nodes don't invoke AI at all.
+Most AI features work on `command` and `prompt` nodes. Loop nodes are thin controllers — the AI fields inside `loop.prompt` are what actually run — **except `model` / `provider` and the reasoning-depth knobs `effort` / `thinking`, which the executor resolves at the loop-node level and forwards to every iteration's AI call** (`loop.escalate` likewise carries `effort`). `bash` and `script` nodes silently ignore AI fields. `approval` and `cancel` nodes don't invoke AI at all.
 
 ## Parameter Selection by Intent
 
