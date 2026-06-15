@@ -72,6 +72,7 @@ import {
 import { withIdleTimeout, STEP_IDLE_TIMEOUT_MS } from './utils/idle-timeout';
 import {
   classifyError,
+  isRetryableProviderErrorSubtype,
   toTelemetryErrorClass,
   detectCreditExhaustion,
   loadCommandPrompt,
@@ -282,7 +283,31 @@ type NodeExecutionResult = NodeOutput & {
   tokens?: TokenUsage;
   /** Loop nodes only: number of iterations executed. */
   loopIterations?: number;
+  /**
+   * Structural provider error subtype for a failed result (e.g. Cursor's opaque
+   * `cursor_error`). Carried from the SDK error-result handlers so the node
+   * retry layer can classify retryability without re-parsing the flattened
+   * message. Internal-only — never zod-validated or persisted.
+   */
+  errorSubtype?: string;
 };
+
+/**
+ * Error thrown when a provider's SDK reports an error-status final result.
+ * Carries the structural {@link errorSubtype} so the retry layer can classify
+ * opaque provider errors (e.g. Cursor's generic `cursor_error`) as retryable
+ * without parsing the flattened message string. FATAL message patterns still
+ * win — the retry decision checks them first — so an auth-flavored variant is
+ * not retried.
+ */
+class ProviderSdkError extends Error {
+  readonly errorSubtype: string;
+  constructor(message: string, errorSubtype: string) {
+    super(message);
+    this.name = 'ProviderSdkError';
+    this.errorSubtype = errorSubtype;
+  }
+}
 
 /**
  * Per-node result returned from the layer map. `provider` is the node's resolved
@@ -1129,7 +1154,10 @@ async function executeNodeInternal(
             },
             'dag.node_sdk_error_result'
           );
-          throw new Error(`Node '${node.id}' failed: SDK returned ${subtype}${errorsDetail}`);
+          throw new ProviderSdkError(
+            `Node '${node.id}' failed: SDK returned ${subtype}${errorsDetail}`,
+            subtype
+          );
         }
         break; // Result is the "I'm done" signal — don't wait for subprocess to exit
       } else if (msg.type === 'system' && msg.content) {
@@ -1572,6 +1600,7 @@ async function executeNodeInternal(
       error: err.message,
       costUsd: nodeCostUsd,
       ...(nodeTokens !== undefined ? { tokens: nodeTokens } : {}),
+      ...(err instanceof ProviderSdkError ? { errorSubtype: err.errorSubtype } : {}),
     };
   }
 }
@@ -2094,6 +2123,15 @@ async function executeLoopNode(
     getLog().error({ err, nodeId: node.id, iteration }, 'loop_node.iteration_event_failed');
   };
 
+  // (B) Per-iteration retry for transient/opaque provider errors. The node-level
+  // retry wrapper is gated OFF for loop nodes (see the `!isLoopNode(node)` guard
+  // in the retry decision), so the loop owns its own retry granularity here: a
+  // single transient blip retries just THAT iteration instead of re-entering the
+  // whole loop. Reuses the same retryability decision as the wrapper — FATAL
+  // message patterns are never retried; TRANSIENT patterns and opaque provider
+  // subtypes (e.g. Cursor's `cursor_error`) are. Bounded by the same defaults.
+  const iterationRetries = new Map<number, number>();
+
   for (let i = startIteration; i <= loop.max_iterations; i++) {
     const iterationStart = Date.now();
 
@@ -2143,8 +2181,13 @@ async function executeLoopNode(
     // trigger errors (e.g. error_during_execution on Claude SDK).
     // User feedback is carried via $LOOP_USER_INPUT, so session continuity is
     // not required for the first resumed iteration.
+    // Also force a fresh session on a (B) per-iteration retry: the prior attempt
+    // may have advanced the session into a bad state before erroring, so resuming
+    // from it could re-trigger the same failure. Impl-style loops re-read their
+    // plan + progress.md from disk, so session continuity is not required here.
+    const isIterationRetry = (iterationRetries.get(i) ?? 0) > 0;
     const needsFreshSession =
-      loop.fresh_context || i === 1 || (isLoopResume && i === startIteration);
+      loop.fresh_context || i === 1 || (isLoopResume && i === startIteration) || isIterationRetry;
     const resumeSessionId = needsFreshSession ? undefined : currentSessionId;
 
     // Stream AI response for this iteration
@@ -2276,8 +2319,9 @@ async function executeLoopNode(
               },
               'loop_node.iteration_sdk_error'
             );
-            throw new Error(
-              `Loop '${node.id}' iteration ${String(i)} failed: SDK returned ${subtype}${errorsDetail}`
+            throw new ProviderSdkError(
+              `Loop '${node.id}' iteration ${String(i)} failed: SDK returned ${subtype}${errorsDetail}`,
+              subtype
             );
           }
           break; // Result is the "I'm done" signal — don't wait for subprocess to exit
@@ -2373,6 +2417,42 @@ async function executeLoopNode(
         .catch((evtErr: Error) => {
           logEventStoreError(evtErr, i);
         });
+
+      // (B) Retry just this iteration on a transient/opaque provider error.
+      // FATAL message patterns (auth, permissions, credits) are never retried,
+      // mirroring the node-level wrapper's precedence; opaque provider subtypes
+      // (e.g. Cursor's `cursor_error`) and TRANSIENT message patterns are.
+      const subtype = err instanceof ProviderSdkError ? err.errorSubtype : undefined;
+      const iterationRetryable =
+        classifyError(err) !== 'FATAL' &&
+        (isTransientNodeError(err.message) || isRetryableProviderErrorSubtype(subtype));
+      const attemptsSoFar = iterationRetries.get(i) ?? 0;
+      if (iterationRetryable && attemptsSoFar < DEFAULT_NODE_MAX_RETRIES) {
+        iterationRetries.set(i, attemptsSoFar + 1);
+        const delayMs = DEFAULT_NODE_RETRY_DELAY_MS * Math.pow(2, attemptsSoFar);
+        getLog().warn(
+          {
+            nodeId: node.id,
+            iteration: i,
+            attempt: attemptsSoFar + 1,
+            maxRetries: DEFAULT_NODE_MAX_RETRIES,
+            delayMs,
+            errorSubtype: subtype,
+            error: err.message,
+          },
+          'loop_node.iteration_transient_retry'
+        );
+        await safeSendMessage(
+          platform,
+          conversationId,
+          `⚠️ Loop \`${node.id}\` iteration ${String(i)} failed with transient error (attempt ${String(attemptsSoFar + 1)}/${String(DEFAULT_NODE_MAX_RETRIES + 1)}). Retrying in ${String(Math.round(delayMs / 1000))}s...`,
+          msgContext
+        );
+        await new Promise(resolve => setTimeout(resolve, delayMs));
+        i--; // re-run this iteration (the for-loop's i++ restores the same index)
+        continue;
+      }
+
       return {
         state: 'failed',
         output: '',
@@ -3451,9 +3531,18 @@ export async function executeDagWorkflow(
             const isFatal = output.error
               ? classifyError(new Error(output.error)) === 'FATAL'
               : false;
-            const isTransient = output.error ? isTransientNodeError(output.error) : false;
+            // TRANSIENT by message pattern OR by structural provider subtype
+            // (e.g. Cursor's opaque `cursor_error`). The subtype signal is an
+            // additional input, classified AFTER isFatal so FATAL still wins.
+            const isTransient =
+              (output.error ? isTransientNodeError(output.error) : false) ||
+              isRetryableProviderErrorSubtype(output.errorSubtype);
+            // Loop nodes own their own per-iteration retry (see executeLoopNode);
+            // the coarse whole-loop wrapper retry is gated off to avoid redoing
+            // already-committed iterations and compounding retries.
             const shouldRetry =
               !isFatal &&
+              !isLoopNode(node) &&
               (retryConfig.onError === 'all' ||
                 (retryConfig.onError === 'transient' && isTransient));
 

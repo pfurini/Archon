@@ -2530,6 +2530,293 @@ describe('executeDagWorkflow -- node-level retry for transient errors', () => {
   }, 5_000);
 });
 
+// Regression coverage for the opaque-provider-error retry fix
+// (docs/plans/loop-transient-error-retry.md). Cursor returns an error-status
+// final with the generic `cursor_error` subtype and no actionable detail; that
+// message matches neither FATAL nor TRANSIENT patterns, so before the fix it
+// classified UNKNOWN and was never retried. (A) carries the structural subtype
+// onto the failed result so the node-level wrapper retries non-loop nodes; (B)
+// retries loop iterations in-place (the wrapper is gated off for loops).
+describe('executeDagWorkflow -- opaque provider-error retry (cursor_error)', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(
+      tmpdir(),
+      `dag-cursor-retry-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    const commandsDir = join(testDir, '.archon', 'commands');
+    await mkdir(commandsDir, { recursive: true });
+    await writeFile(join(commandsDir, 'my-cmd.md'), 'Do something for $USER_MESSAGE');
+
+    mockSendQueryDag.mockClear();
+    mockGetAgentProviderDag.mockClear();
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    }));
+  });
+
+  afterEach(async () => {
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    }));
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup errors
+    }
+  });
+
+  // (A) Structural-signal path: a non-loop node failing with an opaque
+  // cursor_error is retried even though its message matches no TRANSIENT pattern.
+  it('non-loop node retries an opaque cursor_error result and succeeds', async () => {
+    let callCount = 0;
+    mockSendQueryDag.mockImplementation(function* () {
+      callCount++;
+      if (callCount === 1) {
+        // Cursor's opaque error-status final: generic subtype, bare "run error".
+        yield {
+          type: 'result',
+          isError: true,
+          errorSubtype: 'cursor_error',
+          errors: ['run error'],
+        };
+      } else {
+        yield { type: 'assistant', content: 'Recovered' };
+        yield { type: 'result', sessionId: 'cursor-ok' };
+      }
+    });
+
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('dag-cursor-node-run');
+
+    const nodes: DagNode[] = [
+      { id: 'my-node', command: 'my-cmd', retry: { max_attempts: 2, delay_ms: 1 } },
+    ];
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-cursor-node',
+      testDir,
+      { name: 'dag-cursor-node', nodes },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(callCount).toBeGreaterThanOrEqual(2);
+    expect(mockDeps.store.failWorkflowRun as ReturnType<typeof mock>).not.toHaveBeenCalled();
+  }, 5_000);
+
+  // (A) FATAL precedence: an auth-flavored cursor_error must NOT be retried even
+  // though it shares the otherwise-retryable cursor_error subtype.
+  it('non-loop node does NOT retry a FATAL (auth) cursor_error', async () => {
+    let callCount = 0;
+    mockSendQueryDag.mockImplementation(function* () {
+      callCount++;
+      yield {
+        type: 'result',
+        isError: true,
+        errorSubtype: 'cursor_error',
+        errors: ['unauthorized'],
+      };
+    });
+
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('dag-cursor-fatal-run');
+
+    const nodes: DagNode[] = [
+      { id: 'my-node', command: 'my-cmd', retry: { max_attempts: 2, delay_ms: 1 } },
+    ];
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-cursor-fatal',
+      testDir,
+      { name: 'dag-cursor-fatal', nodes },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // FATAL → exactly one attempt, run fails.
+    expect(callCount).toBe(1);
+    expect(mockDeps.store.failWorkflowRun as ReturnType<typeof mock>).toHaveBeenCalled();
+  });
+
+  // (B) Per-iteration retry: a loop iteration that fails once with an opaque
+  // cursor_error is retried in-place and the loop completes. delay_ms is not
+  // configurable for loops (the wrapper is off), so this pays the real 3s base
+  // backoff once — hence the wider timeout.
+  it('loop node retries an opaque cursor_error iteration and completes', async () => {
+    let callCount = 0;
+    mockSendQueryDag.mockImplementation(function* () {
+      callCount++;
+      if (callCount === 1) {
+        yield {
+          type: 'result',
+          isError: true,
+          errorSubtype: 'cursor_error',
+          errors: ['run error'],
+        };
+      } else {
+        yield { type: 'assistant', content: 'All done! <promise>COMPLETE</promise>' };
+        yield { type: 'result', sessionId: 'loop-cursor-ok' };
+      }
+    });
+
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('dag-loop-cursor-run');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-loop-cursor',
+      testDir,
+      {
+        name: 'dag-loop-cursor',
+        nodes: [
+          {
+            id: 'my-loop',
+            loop: { prompt: 'Do a task.', until: 'COMPLETE', max_iterations: 5 },
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // First iteration failed transiently, retried, second succeeded with the signal.
+    expect(callCount).toBe(2);
+    expect(mockDeps.store.failWorkflowRun as ReturnType<typeof mock>).not.toHaveBeenCalled();
+    expect(mockDeps.store.completeWorkflowRun as ReturnType<typeof mock>).toHaveBeenCalled();
+    // The per-iteration retry surfaced a transient-error notice to the platform.
+    const sendCalls = (platform.sendMessage as ReturnType<typeof mock>).mock.calls;
+    const retryMessages = sendCalls.filter(
+      (call: unknown[]) =>
+        typeof call[1] === 'string' && (call[1] as string).includes('transient error')
+    );
+    expect(retryMessages.length).toBeGreaterThan(0);
+  }, 15_000);
+
+  // (B) FATAL precedence inside the loop: an auth-flavored cursor_error fails the
+  // loop immediately without a per-iteration retry.
+  it('loop node does NOT retry a FATAL (auth) cursor_error iteration', async () => {
+    let callCount = 0;
+    mockSendQueryDag.mockImplementation(function* () {
+      callCount++;
+      yield {
+        type: 'result',
+        isError: true,
+        errorSubtype: 'cursor_error',
+        errors: ['credit balance too low'],
+      };
+    });
+
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('dag-loop-fatal-run');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-loop-fatal',
+      testDir,
+      {
+        name: 'dag-loop-fatal',
+        nodes: [
+          {
+            id: 'my-loop',
+            loop: { prompt: 'Do a task.', until: 'COMPLETE', max_iterations: 5 },
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(callCount).toBe(1);
+    expect(mockDeps.store.failWorkflowRun as ReturnType<typeof mock>).toHaveBeenCalled();
+  });
+
+  // No regression / no over-broadening: a non-cursor UNKNOWN loop failure (no
+  // retryable subtype, no TRANSIENT message pattern) still fails without retry.
+  it('loop node does NOT retry a non-retryable UNKNOWN iteration error', async () => {
+    let callCount = 0;
+    mockSendQueryDag.mockImplementation(function* () {
+      callCount++;
+      yield {
+        type: 'result',
+        isError: true,
+        errorSubtype: 'some_other_error',
+        errors: ['a wholly unexpected failure'],
+      };
+    });
+
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('dag-loop-unknown-run');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-loop-unknown',
+      testDir,
+      {
+        name: 'dag-loop-unknown',
+        nodes: [
+          {
+            id: 'my-loop',
+            loop: { prompt: 'Do a task.', until: 'COMPLETE', max_iterations: 5 },
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(callCount).toBe(1);
+    expect(mockDeps.store.failWorkflowRun as ReturnType<typeof mock>).toHaveBeenCalled();
+  });
+});
+
 describe('executeDagWorkflow -- tool_called event persistence', () => {
   let testDir: string;
 

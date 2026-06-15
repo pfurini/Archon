@@ -28,6 +28,7 @@ import {
   isInlineScript,
   formatSubprocessFailure,
   classifyError,
+  isRetryableProviderErrorSubtype,
   toTelemetryErrorClass,
   safeSendMessage,
   type UnknownErrorTracker,
@@ -661,6 +662,30 @@ describe('classifyError', () => {
 
   it('classifies unknown errors as UNKNOWN', () => {
     expect(classifyError(new Error('something completely unexpected happened'))).toBe('UNKNOWN');
+  });
+
+  // An opaque Cursor run error carries no transient/fatal signal in its message,
+  // so classifyError alone returns UNKNOWN — the structural subtype is the only
+  // retryability hint (see isRetryableProviderErrorSubtype).
+  it('classifies an opaque cursor run error message as UNKNOWN (no message signal)', () => {
+    expect(
+      classifyError(new Error("Loop 'impl-w4' iteration 1 failed: cursor_error — run error"))
+    ).toBe('UNKNOWN');
+  });
+});
+
+describe('isRetryableProviderErrorSubtype', () => {
+  it('treats the opaque cursor_error subtype as retryable', () => {
+    expect(isRetryableProviderErrorSubtype('cursor_error')).toBe(true);
+  });
+
+  it('does not treat an unrelated subtype as retryable', () => {
+    expect(isRetryableProviderErrorSubtype('error_max_budget_usd')).toBe(false);
+    expect(isRetryableProviderErrorSubtype('success')).toBe(false);
+  });
+
+  it('returns false for an undefined subtype', () => {
+    expect(isRetryableProviderErrorSubtype(undefined)).toBe(false);
   });
 });
 
