@@ -1,6 +1,6 @@
 # Patch spec: stop archon-internal env from leaking into target-repo commands
 
-**Status:** proposed · **Date:** 2026-06-15 · **Repo:** archon (this repo)
+**Status:** implemented · **Date:** 2026-06-15 · **Repo:** archon (this repo)
 **Audience:** the agent implementing this patch. Self-contained — anchors at the end.
 **Relation to the lexup workaround:** the opsx-wave-harness already works around the symptom with
 `env -u DATABASE_URL pnpm test:e2e` in its gate. This patch is the general, root-level fix so no

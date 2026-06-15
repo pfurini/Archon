@@ -1,6 +1,6 @@
 # Patch spec: loop model-escalation on stall (capability backstop)
 
-**Status:** proposed · **Date:** 2026-06-15 · **Repo:** archon (this repo)
+**Status:** implemented · **Date:** 2026-06-15 · **Repo:** archon (this repo)
 **Audience:** the agent implementing this patch. Self-contained — anchors at the end.
 **Builds on:** the just-landed per-iteration loop retry (A1 + B) in `executeLoopNode`
 (`dag-executor.ts:2126`). This is the **complementary** feature: retry handles *transient* errors
