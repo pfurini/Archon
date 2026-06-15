@@ -3022,6 +3022,61 @@ describe('executeDagWorkflow -- loop model-escalation on stall', () => {
     expect(mockStore.failWorkflowRun as ReturnType<typeof mock>).not.toHaveBeenCalled();
   }, 15_000);
 
+  it('labels the escalated loop session with the fallback provider so the next sequential node does not inherit it', async () => {
+    // Regression: after a loop escalated to its fallback, the layer result was
+    // labelled with the ORIGINAL loop provider. The session boundary then stored
+    // lastSequentialSessionProvider = loopProvider, so a following sequential
+    // node on that same provider inherited the FALLBACK's session id and tried
+    // to --resume it against the wrong backend. The loop must report the
+    // provider that actually produced the session (the fallback).
+    execFileSync('git', ['-C', testDir, 'init'], { stdio: 'ignore' });
+    commitInTestDir('baseline');
+
+    // Primary commits on its first 2 iterations (progress), then stalls.
+    let primaryCalls = 0;
+    primarySend = mock(function* () {
+      primaryCalls++;
+      if (primaryCalls <= 2) commitInTestDir(`c${String(primaryCalls)}`);
+      yield { type: 'assistant', content: 'working...' };
+      yield { type: 'result', sessionId: 'primary' };
+    });
+
+    const mockStore = createMockStore();
+    const mockDeps = createMockDeps(mockStore);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('dag-loop-escalate-boundary-run');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-loop-escalate-boundary',
+      testDir,
+      {
+        name: 'dag-loop-escalate-boundary',
+        nodes: [
+          escalateNode(2),
+          // Sequential follow-up on the ORIGINAL loop provider (claude → primary).
+          { id: 'after', prompt: 'Wrap up.', provider: 'claude', depends_on: ['impl-loop'] },
+        ],
+      } as Parameters<typeof executeDagWorkflow>[4],
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // The loop escalated (so the returned session 'fallback' came from claude-terminal).
+    expect(escalationEvents(mockStore).length).toBe(1);
+    // The 'after' node is the LAST primary (claude) call. It must run on a FRESH
+    // session — the cross-provider boundary rejects the fallback's session id.
+    const afterCall = primarySend.mock.calls[primarySend.mock.calls.length - 1];
+    expect(afterCall[2]).toBeUndefined();
+  }, 15_000);
+
   it('does NOT escalate a healthy loop that commits every iteration', async () => {
     execFileSync('git', ['-C', testDir, 'init'], { stdio: 'ignore' });
     commitInTestDir('baseline');

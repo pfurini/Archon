@@ -290,6 +290,16 @@ type NodeExecutionResult = NodeOutput & {
    * message. Internal-only — never zod-validated or persisted.
    */
   errorSubtype?: string;
+  /**
+   * The provider that actually produced {@link NodeOutput.sessionId}. Differs
+   * from the node's resolved provider only when a loop node escalated to its
+   * fallback (loop.escalate) and the returned session was created by that
+   * fallback. The layer boundary uses this — not the original loop provider —
+   * to label `lastSequentialSessionProvider`, so a following sequential node on
+   * the original provider isn't handed (and made to --resume) a session id the
+   * fallback created. Undefined ⇒ same as the node's resolved provider.
+   */
+  sessionProvider?: string;
 };
 
 /**
@@ -2817,6 +2827,9 @@ async function executeLoopNode(
         state: 'completed',
         output: lastIterationOutput,
         sessionId: currentSessionId,
+        // The session was produced by whatever provider was active at the end —
+        // the fallback if this loop escalated, else the original loop provider.
+        sessionProvider: activeProvider,
         costUsd: loopTotalCostUsd,
         ...(loopTotalTokens !== undefined ? { tokens: loopTotalTokens } : {}),
         loopIterations: i,
@@ -3526,7 +3539,15 @@ export async function executeDagWorkflow(
               issueContext,
               escalation
             );
-            return { nodeId: node.id, output, provider: loopProvider };
+            // Label the layer result with the provider that actually produced
+            // the session (the fallback if this loop escalated), so the
+            // sequential session boundary doesn't hand the fallback's session id
+            // to a later node resolving to the original loop provider.
+            return {
+              nodeId: node.id,
+              output,
+              provider: output.sessionProvider ?? loopProvider,
+            };
           }
 
           // 3c. Approval node dispatch — pauses workflow for human review
