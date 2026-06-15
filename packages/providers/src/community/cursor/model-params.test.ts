@@ -91,6 +91,12 @@ function publicParamIds(modelId: string): Set<string> {
 
 const explicit = <T>(value: T): { value: T; explicit: boolean } => ({ value, explicit: true });
 const implicit = <T>(value: T): { value: T; explicit: boolean } => ({ value, explicit: false });
+/** A blanket cost-tier POLICY knob (how the provider builds `fast`): explicit + policy. */
+const policyFast = (value: boolean): { value: boolean; explicit: boolean; policy: boolean } => ({
+  value,
+  explicit: true,
+  policy: true,
+});
 
 describe('resolveCursorParams', () => {
   describe('effort (id swap + value clamp)', () => {
@@ -152,9 +158,38 @@ describe('resolveCursorParams', () => {
       });
       expect(params).toEqual([{ id: 'fast', value: 'false' }]);
     });
-    it('explicit fast on gemini (no `fast` param) → throws', () => {
+    it('non-policy explicit fast on gemini (no `fast` param) → throws', () => {
+      // A bare explicit knob (no policy flag) the model lacks still fails loud.
       expect(() =>
         resolveCursorParams(FIXTURES, 'gemini-3-flash', { fast: explicit(false) })
+      ).toThrow(CursorModelParamsError);
+    });
+    it('POLICY explicit fast on gemini (no `fast` param) → omitted (no throw)', () => {
+      // The fix: a blanket cost-tier policy knob on a single-tier model is omitted,
+      // not thrown — there is no premium-vs-standard choice to protect.
+      const { params } = resolveCursorParams(FIXTURES, 'gemini-3-flash', {
+        fast: policyFast(false),
+      });
+      expect(params).toEqual([]);
+    });
+    it('POLICY explicit fast=true on gemini (no `fast` param) → omitted (no throw)', () => {
+      const { params } = resolveCursorParams(FIXTURES, 'gemini-3-flash', {
+        fast: policyFast(true),
+      });
+      expect(params).toEqual([]);
+    });
+    it('policy does NOT exempt the value-unavailable case (param present, value missing → throws)', () => {
+      // A model that HAS `fast` but can't express the requested value is a genuine
+      // cost conflict — the policy exemption is scoped to the param-ABSENT branch only.
+      const premiumOnly: ModelListItem[] = [
+        {
+          id: 'premium-only',
+          displayName: 'Premium Only',
+          parameters: [{ id: 'fast', values: [{ value: 'true' }] }],
+        },
+      ];
+      expect(() =>
+        resolveCursorParams(premiumOnly, 'premium-only', { fast: policyFast(false) })
       ).toThrow(CursorModelParamsError);
     });
     it('implicit fast on gemini (no `fast` param) → omitted (no throw)', () => {

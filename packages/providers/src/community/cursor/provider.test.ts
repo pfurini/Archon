@@ -556,6 +556,23 @@ describe('CursorProvider.sendQuery — model parameters', () => {
     expect(calls.cfg?.modelParams).toEqual([{ id: 'fast', value: 'true' }]);
   });
 
+  it('omits config fast on a no-fast model (gemini) — no failure, sidecar spawns', async () => {
+    // Regression: a blanket `assistants.cursor.fast` policy aimed at a model with
+    // no `fast` param (single tier) must omit the knob, NOT fail the node.
+    const { provider, calls } = makeProvider({ messages: [asst('ok')] });
+    const chunks = await collect(
+      provider.sendQuery('x', '/repo', undefined, {
+        ...BASE_OPTS,
+        model: 'gemini-3-flash',
+        assistantConfig: { fast: true },
+      })
+    );
+    expect(result(chunks)?.errorSubtype).toBeUndefined();
+    expect(calls.cfg).toBeDefined(); // sidecar spawned
+    // fast omitted (nothing else emitted) → provider drops the empty param list.
+    expect(calls.cfg?.modelParams).toBeUndefined();
+  });
+
   it('fails closed (cursor_model_params_unavailable, no spawn) on an explicit knob the catalog can not honor', async () => {
     // Catalog is available but does NOT list composer-1; an explicit effort knob
     // therefore can't be validated → fail-loud.

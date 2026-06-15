@@ -16,6 +16,13 @@
  *   can't express → throw {@link CursorModelParamsError} (fail-loud). An IMPLICIT
  *   knob (the cost default `fast=false`) the model lacks → silently omit (there
  *   is simply nothing to apply, e.g. gemini has no `fast` tier).
+ * - **Policy exemption (param ABSENT only).** A blanket cost-tier *policy* knob
+ *   (`fast`) is a billing default, not a per-call request. When the resolved
+ *   model has NO `fast` param at all it exposes a single tier — there is no
+ *   premium-vs-standard choice to protect, so the knob is omitted even when
+ *   explicit (config-sourced), never thrown. This relaxes ONLY the param-absent
+ *   case; a model that HAS `fast` but can't express the requested value is a
+ *   genuine cost conflict and still fails loud.
  *
  * ## Observability caveat
  * The SDK does NOT report the server-resolved/merged params or the billed tier:
@@ -44,6 +51,14 @@ export interface CursorKnob<T> {
   value: T;
   /** `true` if the user asked for this; `false` for the implicit cost default. */
   explicit: boolean;
+  /**
+   * `true` for a blanket cost-tier *policy* knob (`fast`) rather than a per-call
+   * request. Exempts ONLY the param-ABSENT case from fail-loud: a model with no
+   * such param has a single tier, so omitting the knob bills correctly by
+   * definition. Does NOT exempt the value-unavailable case (a model that HAS the
+   * param but can't express the requested value is still a genuine conflict).
+   */
+  policy?: boolean;
 }
 
 /** A `ThinkingConfig`-shaped value (string shorthand or `{ type }` object). */
@@ -246,7 +261,10 @@ function emitSimple<T>(
 ): void {
   const param = findParam(model, paramId);
   if (!param) {
-    if (knob.explicit)
+    // Param ABSENT. A policy knob (`fast`) targets a tier that this model doesn't
+    // expose — there is no premium-vs-standard choice, so omit even when explicit
+    // (omitting bills correctly by definition). Non-policy explicit knobs fail loud.
+    if (knob.explicit && !knob.policy)
       throw new CursorModelParamsError(
         `Model '${modelId}' does not support a ${paramId} parameter.`
       );

@@ -370,10 +370,13 @@ export class CursorProvider implements IAgentProvider {
     if (typeof cfg.context === 'string') knobs.context = { value: cfg.context, explicit: true };
     // parseCursorConfig only ever sets `fast` to a boolean (or throws), so a
     // boolean value IS the presence/explicit signal; absent ⇒ the implicit default.
+    // `policy: true` marks `fast` as a blanket cost-tier default: on a model with
+    // no `fast` param it is omitted (single tier, no ambiguity) rather than
+    // failing loud — see resolveCursorParams' policy-exemption note.
     knobs.fast =
       typeof cfg.fast === 'boolean'
-        ? { value: cfg.fast, explicit: true }
-        : { value: false, explicit: false };
+        ? { value: cfg.fast, explicit: true, policy: true }
+        : { value: false, explicit: false, policy: true };
 
     // Load the durable model catalog (zero blocking network when a snapshot
     // exists) and translate the knobs into a MINIMAL, validated param list.
