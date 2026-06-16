@@ -38,6 +38,9 @@ export {
 // Env loader
 export { loadArchonEnv, isVerboseBoot } from './env-loader';
 
+// Env var name validation (shared by launch boundary, API schema, config loader)
+export { ENV_VAR_NAME_PATTERN, isValidEnvVarName } from './env-name';
+
 // Archon-internal-infra env denylist (mirror of stripCwdEnv)
 export { ARCHON_INTERNAL_ENV_KEYS, buildTargetCommandEnv } from './archon-internal-env';
 

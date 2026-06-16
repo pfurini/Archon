@@ -12,6 +12,7 @@ import {
   getArchonConfigPath,
   getArchonWorkspacesPath,
   getArchonWorktreesPath,
+  isValidEnvVarName,
 } from '@archon/paths';
 import { readFile as fsReadFile, mkdir, writeFile } from 'fs/promises';
 import { dirname, join } from 'path';
@@ -593,9 +594,21 @@ function mergeRepoConfig(merged: MergedConfig, repo: RepoConfig): MergedConfig {
     }
   }
 
-  // Propagate per-project env vars from repo config
+  // Propagate per-project env vars from repo config. A repo's `.archon/config.yaml`
+  // is untrusted input (Archon clones and runs workflows on arbitrary repos), and
+  // env NAMES reach a `bash -c` launch string in the claude-terminal provider —
+  // an invalid name is a command-injection vector (issue #8). Drop invalid names
+  // with a WARN rather than throwing: a malicious repo must not be able to crash
+  // all config loading, and the launch boundary fails loud as the last line of
+  // defense regardless.
   if (repo.env) {
-    result.envVars = { ...result.envVars, ...repo.env };
+    for (const [key, value] of Object.entries(repo.env)) {
+      if (!isValidEnvVarName(key)) {
+        getLog().warn({ key }, 'config.repo_env_var_name_invalid');
+        continue;
+      }
+      result.envVars = { ...result.envVars, [key]: value };
+    }
   }
 
   return result;

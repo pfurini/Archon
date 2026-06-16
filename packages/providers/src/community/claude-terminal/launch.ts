@@ -12,6 +12,7 @@
 import { readdir, realpath } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { isValidEnvVarName } from '@archon/paths';
 
 /** Spec for one TUI launch. */
 export interface ClaudeLaunchSpec {
@@ -107,7 +108,19 @@ export function buildLaunchCommand(
 ): string {
   const unset = STRIPPED_ENV.map(k => `-u ${k}`).join(' ');
   const sets = Object.entries({ ...FORCED_ENV, ...envOverrides })
-    .map(([k, v]) => `${k}=${shellQuote(v)}`)
+    .map(([k, v]) => {
+      // The key is interpolated raw into a `bash -c` string; a name with shell
+      // metacharacters (e.g. `X$(touch /tmp/pwn)`) would execute at launch.
+      // Fail loud before spawning — env names must be POSIX shell identifiers
+      // (issue #8). Values are made safe by shellQuote.
+      if (!isValidEnvVarName(k)) {
+        throw new Error(
+          `Invalid environment variable name: ${JSON.stringify(k)}. ` +
+            'Names must match /^[A-Za-z_][A-Za-z0-9_]*$/ (POSIX shell identifier).'
+        );
+      }
+      return `${k}=${shellQuote(v)}`;
+    })
     .join(' ');
   const envPrefix = `env ${unset}${sets ? ` ${sets}` : ''}`;
   const quotedArgs = args.map(shellQuote).join(' ');

@@ -113,6 +113,36 @@ describe('shellQuote / buildLaunchCommand', () => {
     expect(optIn).toContain("CLAUDE_CODE_DISABLE_ADVISOR_TOOL='0'");
     expect(optIn).not.toContain("CLAUDE_CODE_DISABLE_ADVISOR_TOOL='1'");
   });
+
+  // Regression: env var NAMES are interpolated raw into the `bash -c` string, so
+  // a name with shell metacharacters would execute at launch (RCE — issue #8).
+  it('throws on a command-injection env name and never emits it', () => {
+    const malicious = 'X$(touch /tmp/pwn)';
+    expect(() =>
+      buildLaunchCommand('/bin/claude', ['--session-id', 'u1'], '/w', { [malicious]: 'v' })
+    ).toThrow(/Invalid environment variable name/);
+    // Belt-and-suspenders: the payload must never reach a returned string.
+    try {
+      const cmd = buildLaunchCommand('/bin/claude', [], '/w', { [malicious]: 'v' });
+      expect(cmd).not.toContain('touch');
+    } catch {
+      // throwing is the expected path
+    }
+  });
+
+  it('rejects non-identifier env names (leading digit, dash, dot, empty)', () => {
+    for (const bad of ['1ABC', 'FOO-BAR', 'FOO.BAR', '', 'A B']) {
+      expect(() => buildLaunchCommand('/bin/claude', [], '/w', { [bad]: 'v' })).toThrow(
+        /Invalid environment variable name/
+      );
+    }
+  });
+
+  it('accepts valid POSIX identifier env names', () => {
+    const cmd = buildLaunchCommand('/bin/claude', [], '/w', { FOO_BAR1: 'v', _UNDER: 'x' });
+    expect(cmd).toContain("FOO_BAR1='v'");
+    expect(cmd).toContain("_UNDER='x'");
+  });
 });
 
 describe('expectedTranscriptDir', () => {

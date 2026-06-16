@@ -3,6 +3,7 @@
  */
 import { z } from '@hono/zod-openapi';
 import { codebaseRowSchema } from '@archon/core/schemas/codebase';
+import { ENV_VAR_NAME_PATTERN } from '@archon/paths';
 
 /** A codebase record (wire shape with ISO string dates). */
 export const codebaseSchema = codebaseRowSchema
@@ -44,7 +45,14 @@ export const codebaseEnvVarsResponseSchema = z
 /** Body for PUT /api/codebases/:id/env — upsert one key-value pair */
 export const setEnvVarBodySchema = z
   .object({
-    key: z.string().min(1).max(255),
+    // Constrained to POSIX shell identifiers: names reach a `bash -c` launch
+    // string in the claude-terminal provider, so a name with shell metacharacters
+    // would be an injection vector (issue #8). Reject at the boundary (400, not 500).
+    key: z
+      .string()
+      .min(1)
+      .max(255)
+      .regex(ENV_VAR_NAME_PATTERN, 'Must be a POSIX env var name: ^[A-Za-z_][A-Za-z0-9_]*$'),
     value: z.string(),
   })
   .openapi('SetEnvVarBody');
