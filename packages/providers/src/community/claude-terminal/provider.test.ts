@@ -135,6 +135,37 @@ describe('ClaudeTerminalProvider', () => {
     expect(p.getCapabilities().nativeTools).toBe(false);
   });
 
+  it('default binary resolver honors configured claudeBinaryPath in dev mode (#3)', async () => {
+    // No resolveBinary injected → exercises the real default binding. The bug:
+    // in dev mode the resolver dropped the config path and the provider fell back
+    // to PATH. The fix opts in (`honorConfigInDevMode`), so a missing configured
+    // path now fails fast. This test guards the *wiring* — a revert of the
+    // one-line binding to bare `resolveClaudeBinaryPath` would make it return
+    // undefined → Bun.which → no throw, and this test would catch it.
+    const prevEnv = process.env.CLAUDE_BIN_PATH; // env wins over config — keep it out of the way
+    delete process.env.CLAUDE_BIN_PATH;
+    try {
+      const driver = new FakeDriver([IDLE_SCREEN]);
+      const provider = new ClaudeTerminalProvider({
+        createClient: () => driver,
+        findTranscript: async () => null,
+        sleep: async () => {},
+      });
+
+      await expect(
+        drain(
+          provider.sendQuery('do it', '/work', undefined, {
+            assistantConfig: { claudeBinaryPath: '/nonexistent/claude-xyz' },
+          })
+        )
+      ).rejects.toThrow(
+        'assistants.claude-terminal.claudeBinaryPath is set to "/nonexistent/claude-xyz" but the file does not exist'
+      );
+    } finally {
+      if (prevEnv !== undefined) process.env.CLAUDE_BIN_PATH = prevEnv;
+    }
+  });
+
   it('happy path: boot → trust → inject → tail → result, then stops session', async () => {
     dir = mkdtempSync(join(tmpdir(), 'archon-ct-'));
     const tpath = join(dir, 'sess.jsonl');

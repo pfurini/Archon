@@ -7,7 +7,8 @@
  * environments where SDK auto-resolution picks the wrong variant — most
  * notably glibc Linux hosts, where the SDK prefers the musl binary first
  * and silently falls over with a misleading "not found" error.
- * Config-file path is intentionally NOT honored in dev mode (still binary-only).
+ * Config-file path is NOT honored in dev mode for the default (SDK) caller;
+ * direct-CLI callers (claude-terminal) opt in via `honorConfigInDevMode`.
  */
 import { describe, test, expect, mock, beforeEach, afterAll, spyOn } from 'bun:test';
 import { join } from 'node:path';
@@ -48,6 +49,42 @@ describe('resolveClaudeBinaryPath (dev mode)', () => {
   test('returns undefined when only config path is set (config is binary-mode only)', async () => {
     const result = await resolver.resolveClaudeBinaryPath('/some/custom/path');
     expect(result).toBeUndefined();
+  });
+
+  test('honors config path in dev mode when honorConfigInDevMode is set (#3)', async () => {
+    // Direct-CLI callers (claude-terminal) opt in; the configured path must win
+    // in dev mode instead of being dropped to the SDK self-resolution path.
+    pathKindSpy = spyOn(resolver, 'pathKind').mockReturnValue('file');
+
+    const result = await resolver.resolveClaudeBinaryPath('/config/claude', {
+      honorConfigInDevMode: true,
+    });
+    expect(result).toBe('/config/claude');
+  });
+
+  test('throws (no PATH fallback) when an opted-in config path does not exist in dev mode (#3)', async () => {
+    // The whole point of #3: fail fast instead of silently launching the wrong
+    // `claude` from PATH. The custom source label points at the right config key.
+    pathKindSpy = spyOn(resolver, 'pathKind').mockReturnValue('missing');
+
+    await expect(
+      resolver.resolveClaudeBinaryPath('/nonexistent/claude', {
+        honorConfigInDevMode: true,
+        configSourceLabel: 'assistants.claude-terminal.claudeBinaryPath',
+      })
+    ).rejects.toThrow(
+      'assistants.claude-terminal.claudeBinaryPath is set to "/nonexistent/claude" but the file does not exist'
+    );
+  });
+
+  test('CLAUDE_BIN_PATH env still wins over an opted-in config path in dev mode (#3)', async () => {
+    process.env.CLAUDE_BIN_PATH = '/env/claude';
+    pathKindSpy = spyOn(resolver, 'pathKind').mockReturnValue('file');
+
+    const result = await resolver.resolveClaudeBinaryPath('/config/claude', {
+      honorConfigInDevMode: true,
+    });
+    expect(result).toBe('/env/claude');
   });
 
   test('honors CLAUDE_BIN_PATH env var when file exists', async () => {

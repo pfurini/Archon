@@ -135,7 +135,18 @@ export class ClaudeTerminalProvider implements IAgentProvider {
     this.createClient =
       deps.createClient ??
       ((command): TerminalDriver => new TerminalcpClient(command ? { command } : undefined));
-    this.resolveBinary = deps.resolveBinary ?? resolveClaudeBinaryPath;
+    // Unlike the SDK-based ClaudeProvider, claude-terminal spawns the CLI
+    // directly via terminalcp and has no SDK self-resolution fallback. Opt into
+    // honoring the configured path in dev mode too, so a source/dev install that
+    // sets `assistants.claude-terminal.claudeBinaryPath` launches that binary
+    // instead of silently falling back to PATH (#3).
+    this.resolveBinary =
+      deps.resolveBinary ??
+      ((configured): Promise<string | undefined> =>
+        resolveClaudeBinaryPath(configured, {
+          honorConfigInDevMode: true,
+          configSourceLabel: 'assistants.claude-terminal.claudeBinaryPath',
+        }));
     this.findTranscript = deps.findTranscript ?? findTranscriptByUuid;
     this.sleep =
       deps.sleep ?? ((ms): Promise<void> => new Promise(resolve => setTimeout(resolve, ms)));

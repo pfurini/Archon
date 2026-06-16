@@ -10,13 +10,17 @@
  * 1. `CLAUDE_BIN_PATH` environment variable (honored in both modes — escape
  *    hatch for hosts where the SDK's per-platform binary auto-resolution
  *    picks the wrong variant, e.g. glibc Linux + musl SDK package)
- * 2. `assistants.claude.claudeBinaryPath` in config (binary mode only)
+ * 2. `assistants.claude.claudeBinaryPath` in config (binary mode always;
+ *    dev mode only when the caller opts in via `honorConfigInDevMode`)
  * 3. Autodetect canonical install path (binary mode only — native installer default)
  * 4. Throw with install instructions (binary mode only)
  *
  * In dev mode (BUNDLED_IS_BINARY=false), if no env var is set, returns
- * undefined so the caller omits `pathToClaudeCodeExecutable` entirely and
- * the SDK resolves via its normal node_modules lookup.
+ * undefined so the SDK-based caller omits `pathToClaudeCodeExecutable`
+ * entirely and the SDK resolves via its normal node_modules lookup. Callers
+ * that spawn the CLI directly and have no SDK fallback (e.g. claude-terminal)
+ * pass `honorConfigInDevMode: true` so the configured path is honored in dev
+ * mode too.
  */
 import { existsSync as _existsSync, statSync as _statSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -112,6 +116,24 @@ const INSTALL_INSTRUCTIONS =
   '        claudeBinaryPath: /absolute/path/to/claude\n\n' +
   'See: https://archon.diy/docs/reference/configuration#claude';
 
+/** Options for callers that diverge from the SDK-based resolution contract. */
+export interface ResolveClaudeBinaryOptions {
+  /**
+   * Honor `configClaudeBinaryPath` in dev mode too (default: false). The
+   * SDK-based provider leaves this off because in dev mode the SDK
+   * self-resolves from its node_modules platform package. Direct-CLI callers
+   * (claude-terminal) set it true: they spawn the executable themselves and
+   * have no SDK fallback, so a configured path must win in every mode.
+   */
+  honorConfigInDevMode?: boolean;
+  /**
+   * Label for the config source in validation error messages
+   * (default: 'assistants.claude.claudeBinaryPath'). Lets a non-SDK caller
+   * point the user at the correct config key.
+   */
+  configSourceLabel?: string;
+}
+
 /**
  * Resolve the path to the Claude Code executable (native binary in SDK 0.2.x;
  * legacy `cli.js` is still accepted for operators pinned to npm-installed
@@ -119,12 +141,15 @@ const INSTALL_INSTRUCTIONS =
  *
  * In dev mode: honors `CLAUDE_BIN_PATH` if set; otherwise returns undefined
  * (let SDK resolve from its bundled per-platform native binary in
- * `@anthropic-ai/claude-agent-sdk-<platform>`).
+ * `@anthropic-ai/claude-agent-sdk-<platform>`) — unless the caller passes
+ * `honorConfigInDevMode: true`, in which case a configured path is honored
+ * here too.
  * In binary mode: resolves from env/config/autodetect, or throws with
  * install instructions.
  */
 export async function resolveClaudeBinaryPath(
-  configClaudeBinaryPath?: string
+  configClaudeBinaryPath?: string,
+  options?: ResolveClaudeBinaryOptions
 ): Promise<string | undefined> {
   // 1. Environment variable override — honored in dev mode too, so operators
   // on libc mismatches (e.g. glibc host with the SDK's musl variant first in
@@ -136,17 +161,20 @@ export async function resolveClaudeBinaryPath(
     return resolvedEnv;
   }
 
-  if (!BUNDLED_IS_BINARY) return undefined;
-
-  // 2. Config file override
-  if (configClaudeBinaryPath) {
+  // 2. Config file override — always honored in binary mode; in dev mode only
+  // when the caller opts in (direct-CLI callers without an SDK fallback). The
+  // check precedes the dev-mode short-circuit so the configured path is not
+  // silently dropped for opted-in callers.
+  if (configClaudeBinaryPath && (BUNDLED_IS_BINARY || options?.honorConfigInDevMode)) {
     const resolvedConfig = validateAndExpand(
       configClaudeBinaryPath,
-      'assistants.claude.claudeBinaryPath'
+      options?.configSourceLabel ?? 'assistants.claude.claudeBinaryPath'
     );
     getLog().info({ binaryPath: resolvedConfig, source: 'config' }, 'claude.binary_resolved');
     return resolvedConfig;
   }
+
+  if (!BUNDLED_IS_BINARY) return undefined;
 
   // 3. Autodetect — the Anthropic native installer
   // (`curl -fsSL https://claude.ai/install.sh | bash` on macOS/Linux,
