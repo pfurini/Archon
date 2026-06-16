@@ -84,10 +84,14 @@ describe('effortOptionsForAgent', () => {
     expect(effortOptionsForAgent('codex')).toEqual(['minimal', 'low', 'medium', 'high', 'xhigh']);
   });
 
-  test('agents where tier effort does not route get null (field hidden)', () => {
-    expect(effortOptionsForAgent('pi')).toBeNull();
+  test('other effortControl agents expose the portable canonical set (#6)', () => {
+    for (const agent of ['claude-terminal', 'pi', 'copilot', 'cursor']) {
+      expect(effortOptionsForAgent(agent)).toEqual(['low', 'medium', 'high', 'max']);
+    }
+  });
+
+  test('agents with no effort concept get null (field hidden)', () => {
     expect(effortOptionsForAgent('opencode')).toBeNull();
-    expect(effortOptionsForAgent('copilot')).toBeNull();
     expect(effortOptionsForAgent('')).toBeNull();
   });
 });
@@ -102,8 +106,13 @@ describe('normalizeEffortForAgent', () => {
     expect(normalizeEffortForAgent('claude', 'minimal')).toBe('');
   });
 
+  test('keeps a canonical value when switching to another portable-effort agent (#6)', () => {
+    expect(normalizeEffortForAgent('pi', 'high')).toBe('high');
+    expect(normalizeEffortForAgent('cursor', 'max')).toBe('max');
+  });
+
   test('clears any value for agents without an effort concept', () => {
-    expect(normalizeEffortForAgent('pi', 'high')).toBe('');
+    expect(normalizeEffortForAgent('opencode', 'high')).toBe('');
     expect(normalizeEffortForAgent('', 'high')).toBe('');
   });
 });

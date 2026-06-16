@@ -242,34 +242,39 @@ export type EffortRouting =
   | { field: 'modelReasoningEffort'; value: string };
 
 /**
- * Route a preset's `effort` to the field the resolved provider understands —
- * Claude's generic node `effort` or Codex's `modelReasoningEffort`. Returns
- * `null` when the value isn't valid for that provider (e.g. a cross-provider
- * mismatch like `effort: 'max'` on Codex); callers MUST surface that rather
- * than silently dropping it. Single source of truth for both the DAG executor
- * and the chat orchestrator.
+ * Route a preset's `effort` to the field the resolved provider understands.
+ * Codex consumes its own `modelReasoningEffort` enum; every other provider
+ * consumes the portable canonical node `effort` (`low|medium|high|max`), which
+ * each provider translates to its native vocabulary via `EFFORT_MAPS` /
+ * `mapEffort()` in `@archon/providers` (OpenCode has no effort concept and
+ * ignores the landed value harmlessly). Returns `null` when the value isn't
+ * valid for that provider (e.g. a cross-provider mismatch like `effort: 'xhigh'`
+ * on a non-Codex provider); callers MUST surface that rather than silently
+ * dropping it. Single source of truth for both the DAG executor and the chat
+ * orchestrator.
  */
 export function routePresetEffort(provider: string, effort: string): EffortRouting | null {
-  if (provider === 'claude' && CLAUDE_EFFORTS.has(effort)) {
-    return { field: 'effort', value: effort };
+  if (provider === 'codex') {
+    return CODEX_REASONING_EFFORTS.has(effort)
+      ? { field: 'modelReasoningEffort', value: effort }
+      : null;
   }
-  if (provider === 'codex' && CODEX_REASONING_EFFORTS.has(effort)) {
-    return { field: 'modelReasoningEffort', value: effort };
-  }
-  return null;
+  return CLAUDE_EFFORTS.has(effort) ? { field: 'effort', value: effort } : null;
 }
 
 /**
- * The effort vocabulary for a provider, or `null` if the provider has no known
- * effort concept (Pi/OpenRouter/Copilot/OpenCode — effort doesn't route there).
- * Lets the tier-config write path (route + CLI) validate `effort` UP FRONT
- * instead of letting `routePresetEffort` silently drop an unknown value at run
- * time (so `--effort ultra` errors instead of succeeding with no effect).
+ * The effort vocabulary `routePresetEffort` will accept for a provider — Codex's
+ * `modelReasoningEffort` enum, or the portable canonical set (`low|medium|high|max`)
+ * for every other provider. Mirrors `routePresetEffort` exactly so the tier-config
+ * write path (route + CLI) can validate `effort` UP FRONT instead of letting
+ * `routePresetEffort` silently drop an out-of-vocab value at run time (so
+ * `--effort xhigh` on a non-Codex provider errors instead of succeeding with no
+ * effect). Never `null` today; the `| null` signature is retained defensively for
+ * any future provider with no effort concept.
  */
 export function validEffortsForProvider(provider: string): readonly string[] | null {
-  if (provider === 'claude') return [...CLAUDE_EFFORTS];
   if (provider === 'codex') return [...CODEX_REASONING_EFFORTS];
-  return null;
+  return [...CLAUDE_EFFORTS];
 }
 
 /**

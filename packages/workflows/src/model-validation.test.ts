@@ -2,10 +2,13 @@ import { describe, expect, test } from 'bun:test';
 
 import {
   buildAiProfile,
+  isEffortValidForProvider,
   isLiteralSpec,
   resolveModelSpec,
   resolveTierWithFallback,
+  routePresetEffort,
   TIER_NAMES,
+  validEffortsForProvider,
   type ModelAliasPreset,
   type ResolvedAiProfile,
 } from './model-validation';
@@ -521,5 +524,72 @@ describe('isLiteralSpec type guard', () => {
 
   test('returns false for a ModelAliasPreset', () => {
     expect(isLiteralSpec({ provider: 'claude', model: 'opus' })).toBe(false);
+  });
+});
+
+describe('routePresetEffort — cross-provider effort routing (#6)', () => {
+  // Every provider with the `effortControl` capability, plus OpenCode (no effort
+  // concept) as the harmless-ignore case.
+  const EFFORT_PROVIDERS = [
+    'claude',
+    'claude-terminal',
+    'codex',
+    'pi',
+    'copilot',
+    'cursor',
+    'opencode',
+  ];
+  const CANONICAL = ['low', 'medium', 'high', 'max'];
+
+  test('Codex routes to modelReasoningEffort and accepts its own enum', () => {
+    expect(routePresetEffort('codex', 'high')).toEqual({
+      field: 'modelReasoningEffort',
+      value: 'high',
+    });
+    // `xhigh` is valid Codex vocab; `max` is NOT (Codex enum has no `max`).
+    expect(routePresetEffort('codex', 'xhigh')).toEqual({
+      field: 'modelReasoningEffort',
+      value: 'xhigh',
+    });
+    expect(routePresetEffort('codex', 'max')).toBeNull();
+  });
+
+  test('every non-Codex provider routes canonical effort to the portable node `effort`', () => {
+    for (const provider of EFFORT_PROVIDERS.filter(p => p !== 'codex')) {
+      for (const effort of CANONICAL) {
+        expect(routePresetEffort(provider, effort)).toEqual({ field: 'effort', value: effort });
+      }
+    }
+  });
+
+  test('non-Codex providers reject out-of-vocab (provider-native) effort values', () => {
+    // `xhigh` is Codex/Pi/Copilot NATIVE vocab — not the portable canonical set,
+    // so it must NOT silently route on the portable `effort` field.
+    expect(routePresetEffort('cursor', 'xhigh')).toBeNull();
+    expect(routePresetEffort('pi', 'minimal')).toBeNull();
+    expect(routePresetEffort('claude', 'ultra')).toBeNull();
+  });
+
+  test('write-path validator mirrors routePresetEffort exactly (no silent-drop gap)', () => {
+    const samples = ['low', 'medium', 'high', 'max', 'xhigh', 'minimal', 'ultra'];
+    for (const provider of EFFORT_PROVIDERS) {
+      for (const effort of samples) {
+        expect(isEffortValidForProvider(provider, effort)).toBe(
+          routePresetEffort(provider, effort) !== null
+        );
+      }
+    }
+  });
+});
+
+describe('validEffortsForProvider — write-path vocabulary (#6)', () => {
+  test('Codex exposes its modelReasoningEffort enum', () => {
+    expect(validEffortsForProvider('codex')).toEqual(['minimal', 'low', 'medium', 'high', 'xhigh']);
+  });
+
+  test('every other provider exposes the portable canonical set', () => {
+    for (const provider of ['claude', 'claude-terminal', 'pi', 'copilot', 'cursor', 'opencode']) {
+      expect(validEffortsForProvider(provider)).toEqual(['low', 'medium', 'high', 'max']);
+    }
   });
 });
