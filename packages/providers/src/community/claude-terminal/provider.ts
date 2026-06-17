@@ -183,15 +183,23 @@ export class ClaudeTerminalProvider implements IAgentProvider {
 
     // Resolve the effective Claude config dir (CLAUDE_CONFIG_DIR). When set, the
     // spawned TUI reads/writes ALL user-scope config (settings, transcripts,
-    // .claude.json auth) from this dir — fully isolating Archon from the
-    // operator's personal ~/.claude. Both sides must agree on the SAME resolved
-    // absolute path: we inject it into the child env (write side) AND scan it
-    // for the transcript (read side). Precedence: codebase env override > config
-    // option > ambient CLAUDE_CONFIG_DIR > default (~/.claude, claudeConfigDir
-    // left undefined so behavior stays byte-identical for non-isolated users).
+    // .claude.json auth) from this dir — isolating Archon from the operator's
+    // personal ~/.claude. Both sides must agree on the SAME resolved absolute
+    // path: we inject it into the child env (write side) AND scan it for the
+    // transcript (read side).
+    //
+    // Precedence: trusted assistant config > env bag > ambient > default.
+    // `config.claudeConfigDir` (from .archon/config.yaml assistants) wins over a
+    // CLAUDE_CONFIG_DIR found in requestOptions.env on purpose: that env bag is a
+    // FLAT merge that includes a cloned repo's untrusted `env:` block, and an
+    // explicit operator isolation setting must not be silently reversible by
+    // forwarded/untrusted env (a repo could otherwise redirect the run back to
+    // ~/.claude). The env/ambient fallback still serves installs that ONLY set
+    // CLAUDE_CONFIG_DIR via env. When nothing is set, claudeConfigDir stays
+    // undefined so behavior is byte-identical for non-isolated users.
     const explicitConfigDir =
-      requestOptions?.env?.CLAUDE_CONFIG_DIR ??
       config.claudeConfigDir ??
+      requestOptions?.env?.CLAUDE_CONFIG_DIR ??
       process.env.CLAUDE_CONFIG_DIR;
     const claudeConfigDir = explicitConfigDir
       ? resolveClaudeConfigDir(explicitConfigDir)

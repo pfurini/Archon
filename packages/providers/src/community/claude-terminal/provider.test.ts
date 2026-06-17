@@ -317,7 +317,7 @@ describe('ClaudeTerminalProvider', () => {
       expect(roots.every(r => r === join('/srv/archon-claude', 'projects'))).toBe(true);
     });
 
-    it('a codebase CLAUDE_CONFIG_DIR env var overrides the config option', async () => {
+    it('trusted config wins over a CLAUDE_CONFIG_DIR in the env bag (untrusted repo env cannot defeat isolation)', async () => {
       clearAmbient();
       dir = mkdtempSync(join(tmpdir(), 'archon-ct-'));
       const tpath = join(dir, 'sess.jsonl');
@@ -335,14 +335,45 @@ describe('ClaudeTerminalProvider', () => {
 
       await drain(
         provider.sendQuery('do it', '/work', undefined, {
-          assistantConfig: { claudeConfigDir: '/from/config' },
+          assistantConfig: { claudeConfigDir: '/trusted/isolation' },
+          // Simulates a cloned repo's untrusted `env:` block trying to redirect
+          // the run back to the operator's personal config.
+          env: { CLAUDE_CONFIG_DIR: '/from/repo-env' },
+        })
+      );
+
+      const startCmd = driver.calls.find(c => c.m === 'start')?.segments?.[0] ?? '';
+      // Both the injected child env AND the transcript root use the trusted dir;
+      // the repo-supplied value is overwritten, not honored.
+      expect(startCmd).toContain("CLAUDE_CONFIG_DIR='/trusted/isolation'");
+      expect(startCmd).not.toContain('/from/repo-env');
+      expect(roots.every(r => r === join('/trusted/isolation', 'projects'))).toBe(true);
+    });
+
+    it('falls back to a CLAUDE_CONFIG_DIR in the env bag when no config option is set', async () => {
+      clearAmbient();
+      dir = mkdtempSync(join(tmpdir(), 'archon-ct-'));
+      const tpath = join(dir, 'sess.jsonl');
+      const roots: (string | undefined)[] = [];
+      const driver = new FakeDriver([IDLE_SCREEN], () => writeFileSync(tpath, TURN_LINES));
+      const provider = new ClaudeTerminalProvider({
+        createClient: () => driver,
+        resolveBinary: async () => '/fake/claude',
+        findTranscript: async (_id, root) => {
+          roots.push(root);
+          return existsSync(tpath) ? tpath : null;
+        },
+        sleep: async () => {},
+      });
+
+      await drain(
+        provider.sendQuery('do it', '/work', undefined, {
           env: { CLAUDE_CONFIG_DIR: '/from/env' },
         })
       );
 
       const startCmd = driver.calls.find(c => c.m === 'start')?.segments?.[0] ?? '';
       expect(startCmd).toContain("CLAUDE_CONFIG_DIR='/from/env'");
-      expect(startCmd).not.toContain('/from/config');
       expect(roots.every(r => r === join('/from/env', 'projects'))).toBe(true);
     });
 

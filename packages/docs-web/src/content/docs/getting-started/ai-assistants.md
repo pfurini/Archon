@@ -833,7 +833,9 @@ A single directory isolates **everything user-scoped** (verified against Claude 
 A fresh config dir is unauthenticated. Because the provider drives the TUI unattended and only dismisses the folder-trust dialog (not login/onboarding), you must **run `CLAUDE_CONFIG_DIR=<dir> claude` once by hand** — log in and finish onboarding — before using it in workflows. Skip this and the first turn fails at boot with `did not become input-ready` (the error names the dir and the exact command to run).
 :::
 
-**Precedence** (highest first): a codebase `CLAUDE_CONFIG_DIR` env var → this `claudeConfigDir` option → an ambient `CLAUDE_CONFIG_DIR` in Archon's environment → default `~/.claude`. `CLAUDE_CONFIG_DIR` isolates the **config dir + auth** only — not inherited `ANTHROPIC_*`/`CLAUDE_CODE_*` env or enterprise managed settings. For a true *execution* boundary, rely on worktree isolation.
+**Precedence** (highest first): this `claudeConfigDir` option → a `CLAUDE_CONFIG_DIR` in the request env bag → an ambient `CLAUDE_CONFIG_DIR` in Archon's environment → default `~/.claude`. The trusted config option wins over the env bag on purpose — that bag includes a cloned repo's untrusted `env:` block, so an explicit isolation setting can't be silently reversed by forwarded env.
+
+`CLAUDE_CONFIG_DIR` isolates the **config dir + auth** only — treat it as defense-in-depth, not a security boundary. It doesn't sandbox inherited `ANTHROPIC_*`/`CLAUDE_CODE_*` env or enterprise managed settings, and a repo's `assistants:` block can still override it (as it can `claudeBinaryPath`). For a true *execution* boundary rely on worktree isolation — and note worktrees share `HOME`, so an untrusted run can reach `~/.claude*` via the shell anyway.
 
 ### Supported Archon Features
 
