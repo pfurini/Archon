@@ -1733,9 +1733,12 @@ export function registerApiRoutes(
         .join(', ')}`;
     }
     if (entry.effort !== undefined && !isEffortValidForProvider(entry.provider, entry.effort)) {
+      const valid = validEffortsForProvider(entry.provider);
+      const validMsg =
+        valid && valid.length > 0 ? valid.join(', ') : '(this provider has no effort setting)';
       return (
         `Invalid effort '${entry.effort}' for provider '${entry.provider}' (${label}). ` +
-        `Valid: ${validEffortsForProvider(entry.provider)?.join(', ') ?? '(none)'}`
+        `Valid: ${validMsg}`
       );
     }
     return null;

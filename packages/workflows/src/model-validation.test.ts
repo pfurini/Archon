@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 
+import { registerBuiltinProviders, registerCommunityProviders } from '@archon/providers';
+
 import {
   buildAiProfile,
   isEffortValidForProvider,
@@ -12,6 +14,11 @@ import {
   type ModelAliasPreset,
   type ResolvedAiProfile,
 } from './model-validation';
+
+// routePresetEffort / validEffortsForProvider consult getProviderCapabilities,
+// which requires the provider registry to be populated (idempotent calls).
+registerBuiltinProviders();
+registerCommunityProviders();
 
 describe('TIER_NAMES constant', () => {
   test('contains exactly small, medium, large', () => {
@@ -528,17 +535,12 @@ describe('isLiteralSpec type guard', () => {
 });
 
 describe('routePresetEffort — cross-provider effort routing (#6)', () => {
-  // Every provider with the `effortControl` capability, plus OpenCode (no effort
-  // concept) as the harmless-ignore case.
-  const EFFORT_PROVIDERS = [
-    'claude',
-    'claude-terminal',
-    'codex',
-    'pi',
-    'copilot',
-    'cursor',
-    'opencode',
-  ];
+  // Non-Codex providers that DO consume the portable canonical node `effort`
+  // (effortControl: true). Codex (its own enum) and OpenCode (no effort) tested
+  // separately.
+  const PORTABLE_EFFORT_PROVIDERS = ['claude', 'claude-terminal', 'pi', 'copilot', 'cursor'];
+  // All registered providers touched by effort routing, for the invariant sweep.
+  const ALL_EFFORT_PROVIDERS = [...PORTABLE_EFFORT_PROVIDERS, 'codex', 'opencode'];
   const CANONICAL = ['low', 'medium', 'high', 'max'];
 
   test('Codex routes to modelReasoningEffort and accepts its own enum', () => {
@@ -554,11 +556,19 @@ describe('routePresetEffort — cross-provider effort routing (#6)', () => {
     expect(routePresetEffort('codex', 'max')).toBeNull();
   });
 
-  test('every non-Codex provider routes canonical effort to the portable node `effort`', () => {
-    for (const provider of EFFORT_PROVIDERS.filter(p => p !== 'codex')) {
+  test('every effortControl non-Codex provider routes canonical effort to the portable node `effort`', () => {
+    for (const provider of PORTABLE_EFFORT_PROVIDERS) {
       for (const effort of CANONICAL) {
         expect(routePresetEffort(provider, effort)).toEqual({ field: 'effort', value: effort });
       }
+    }
+  });
+
+  test('a provider without effortControl (OpenCode) routes null so the caller can warn', () => {
+    // OpenCode has effortControl: false — effort must NOT land on nodeConfig.effort
+    // (the provider ignores it); null lets the consumer emit preset_effort_unsupported.
+    for (const effort of CANONICAL) {
+      expect(routePresetEffort('opencode', effort)).toBeNull();
     }
   });
 
@@ -572,7 +582,7 @@ describe('routePresetEffort — cross-provider effort routing (#6)', () => {
 
   test('write-path validator mirrors routePresetEffort exactly (no silent-drop gap)', () => {
     const samples = ['low', 'medium', 'high', 'max', 'xhigh', 'minimal', 'ultra'];
-    for (const provider of EFFORT_PROVIDERS) {
+    for (const provider of ALL_EFFORT_PROVIDERS) {
       for (const effort of samples) {
         expect(isEffortValidForProvider(provider, effort)).toBe(
           routePresetEffort(provider, effort) !== null
@@ -587,9 +597,15 @@ describe('validEffortsForProvider — write-path vocabulary (#6)', () => {
     expect(validEffortsForProvider('codex')).toEqual(['minimal', 'low', 'medium', 'high', 'xhigh']);
   });
 
-  test('every other provider exposes the portable canonical set', () => {
-    for (const provider of ['claude', 'claude-terminal', 'pi', 'copilot', 'cursor', 'opencode']) {
+  test('every effortControl non-Codex provider exposes the portable canonical set', () => {
+    for (const provider of ['claude', 'claude-terminal', 'pi', 'copilot', 'cursor']) {
       expect(validEffortsForProvider(provider)).toEqual(['low', 'medium', 'high', 'max']);
     }
+  });
+
+  test('a provider without effortControl (OpenCode) exposes an empty vocabulary (rejected up front)', () => {
+    // Empty (not null) keeps the write/runtime invariant and makes the CLI/route
+    // reject `--effort` on OpenCode instead of accepting a no-op value.
+    expect(validEffortsForProvider('opencode')).toEqual([]);
   });
 });
