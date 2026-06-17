@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach } from 'bun:test';
 import { mkdtempSync, writeFileSync, appendFileSync, existsSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { ClaudeTerminalProvider } from './provider';
@@ -270,6 +270,157 @@ describe('ClaudeTerminalProvider', () => {
 
     const startCmd = driver.calls.find(c => c.m === 'start')?.segments?.[0] ?? '';
     expect(startCmd).not.toContain('--effort');
+  });
+
+  describe('CLAUDE_CONFIG_DIR isolation', () => {
+    // The resolver reads ambient process.env.CLAUDE_CONFIG_DIR as a fallback
+    // source; pin it OFF so these assertions don't depend on the dev/CI env
+    // (mirrors the CLAUDE_BIN_PATH delete/restore dance above).
+    let prevAmbient: string | undefined;
+    afterEach(() => {
+      if (prevAmbient !== undefined) process.env.CLAUDE_CONFIG_DIR = prevAmbient;
+      else delete process.env.CLAUDE_CONFIG_DIR;
+      prevAmbient = undefined;
+    });
+    function clearAmbient(): void {
+      prevAmbient = process.env.CLAUDE_CONFIG_DIR;
+      delete process.env.CLAUDE_CONFIG_DIR;
+    }
+
+    it('injects the configured dir into the launch env AND scans it for the transcript', async () => {
+      clearAmbient();
+      dir = mkdtempSync(join(tmpdir(), 'archon-ct-'));
+      const tpath = join(dir, 'sess.jsonl');
+      const roots: (string | undefined)[] = [];
+      const driver = new FakeDriver([IDLE_SCREEN], () => writeFileSync(tpath, TURN_LINES));
+      const provider = new ClaudeTerminalProvider({
+        createClient: () => driver,
+        resolveBinary: async () => '/fake/claude',
+        findTranscript: async (_id, root) => {
+          roots.push(root);
+          return existsSync(tpath) ? tpath : null;
+        },
+        sleep: async () => {},
+      });
+
+      await drain(
+        provider.sendQuery('do it', '/work', undefined, {
+          assistantConfig: { claudeConfigDir: '/srv/archon-claude' },
+        })
+      );
+
+      const startCmd = driver.calls.find(c => c.m === 'start')?.segments?.[0] ?? '';
+      // Write side: child env carries the (single-quoted) resolved absolute dir.
+      expect(startCmd).toContain("CLAUDE_CONFIG_DIR='/srv/archon-claude'");
+      // Read side: every transcript scan targets <configDir>/projects.
+      expect(roots.length).toBeGreaterThan(0);
+      expect(roots.every(r => r === join('/srv/archon-claude', 'projects'))).toBe(true);
+    });
+
+    it('trusted config wins over a CLAUDE_CONFIG_DIR in the env bag (untrusted repo env cannot defeat isolation)', async () => {
+      clearAmbient();
+      dir = mkdtempSync(join(tmpdir(), 'archon-ct-'));
+      const tpath = join(dir, 'sess.jsonl');
+      const roots: (string | undefined)[] = [];
+      const driver = new FakeDriver([IDLE_SCREEN], () => writeFileSync(tpath, TURN_LINES));
+      const provider = new ClaudeTerminalProvider({
+        createClient: () => driver,
+        resolveBinary: async () => '/fake/claude',
+        findTranscript: async (_id, root) => {
+          roots.push(root);
+          return existsSync(tpath) ? tpath : null;
+        },
+        sleep: async () => {},
+      });
+
+      await drain(
+        provider.sendQuery('do it', '/work', undefined, {
+          assistantConfig: { claudeConfigDir: '/trusted/isolation' },
+          // Simulates a cloned repo's untrusted `env:` block trying to redirect
+          // the run back to the operator's personal config.
+          env: { CLAUDE_CONFIG_DIR: '/from/repo-env' },
+        })
+      );
+
+      const startCmd = driver.calls.find(c => c.m === 'start')?.segments?.[0] ?? '';
+      // Both the injected child env AND the transcript root use the trusted dir;
+      // the repo-supplied value is overwritten, not honored.
+      expect(startCmd).toContain("CLAUDE_CONFIG_DIR='/trusted/isolation'");
+      expect(startCmd).not.toContain('/from/repo-env');
+      expect(roots.every(r => r === join('/trusted/isolation', 'projects'))).toBe(true);
+    });
+
+    it('falls back to a CLAUDE_CONFIG_DIR in the env bag when no config option is set', async () => {
+      clearAmbient();
+      dir = mkdtempSync(join(tmpdir(), 'archon-ct-'));
+      const tpath = join(dir, 'sess.jsonl');
+      const roots: (string | undefined)[] = [];
+      const driver = new FakeDriver([IDLE_SCREEN], () => writeFileSync(tpath, TURN_LINES));
+      const provider = new ClaudeTerminalProvider({
+        createClient: () => driver,
+        resolveBinary: async () => '/fake/claude',
+        findTranscript: async (_id, root) => {
+          roots.push(root);
+          return existsSync(tpath) ? tpath : null;
+        },
+        sleep: async () => {},
+      });
+
+      await drain(
+        provider.sendQuery('do it', '/work', undefined, {
+          env: { CLAUDE_CONFIG_DIR: '/from/env' },
+        })
+      );
+
+      const startCmd = driver.calls.find(c => c.m === 'start')?.segments?.[0] ?? '';
+      expect(startCmd).toContain("CLAUDE_CONFIG_DIR='/from/env'");
+      expect(roots.every(r => r === join('/from/env', 'projects'))).toBe(true);
+    });
+
+    it('no explicit source → no injection, default ~/.claude/projects scanned (byte-identical)', async () => {
+      clearAmbient();
+      dir = mkdtempSync(join(tmpdir(), 'archon-ct-'));
+      const tpath = join(dir, 'sess.jsonl');
+      const roots: (string | undefined)[] = [];
+      const driver = new FakeDriver([IDLE_SCREEN], () => writeFileSync(tpath, TURN_LINES));
+      const provider = new ClaudeTerminalProvider({
+        createClient: () => driver,
+        resolveBinary: async () => '/fake/claude',
+        findTranscript: async (_id, root) => {
+          roots.push(root);
+          return existsSync(tpath) ? tpath : null;
+        },
+        sleep: async () => {},
+      });
+
+      await drain(provider.sendQuery('do it', '/work'));
+
+      const startCmd = driver.calls.find(c => c.m === 'start')?.segments?.[0] ?? '';
+      expect(startCmd).not.toContain('CLAUDE_CONFIG_DIR');
+      expect(roots.every(r => r === join(homedir(), '.claude', 'projects'))).toBe(true);
+    });
+
+    it('honors an ambient CLAUDE_CONFIG_DIR on the read side (fixes the latent desync)', async () => {
+      clearAmbient();
+      process.env.CLAUDE_CONFIG_DIR = '/ambient/claude';
+      dir = mkdtempSync(join(tmpdir(), 'archon-ct-'));
+      const tpath = join(dir, 'sess.jsonl');
+      const roots: (string | undefined)[] = [];
+      const driver = new FakeDriver([IDLE_SCREEN], () => writeFileSync(tpath, TURN_LINES));
+      const provider = new ClaudeTerminalProvider({
+        createClient: () => driver,
+        resolveBinary: async () => '/fake/claude',
+        findTranscript: async (_id, root) => {
+          roots.push(root);
+          return existsSync(tpath) ? tpath : null;
+        },
+        sleep: async () => {},
+      });
+
+      await drain(provider.sendQuery('do it', '/work'));
+
+      expect(roots.every(r => r === join('/ambient/claude', 'projects'))).toBe(true);
+    });
   });
 
   it('aborts cleanly and still stops the session', async () => {

@@ -799,7 +799,7 @@ Requirements:
 
 ### Authenticate
 
-No separate authentication: `claude-terminal` launches your installed `claude` CLI, so it uses whatever Claude Code itself is logged into (a Claude Pro/Max subscription via `claude /login`, or env-var tokens) — the same credential source as the built-in provider.
+No separate authentication: `claude-terminal` launches your installed `claude` CLI, so it uses whatever Claude Code itself is logged into (a Claude Pro/Max subscription via `claude /login`, or env-var tokens) — the same credential source as the built-in provider. To give Archon its **own** isolated login + config instead of sharing your personal `~/.claude`, see [Isolating Archon's Claude config](#isolating-archons-claude-config-claude_config_dir) below.
 
 ### Configuration Options
 
@@ -809,12 +809,33 @@ assistants:
   claude-terminal:
     model: sonnet                  # passed to `claude --model`
     claudeBinaryPath: /abs/claude  # optional; otherwise resolved from PATH
+    claudeConfigDir: ~/.archon/claude-home  # optional; isolated CLAUDE_CONFIG_DIR (see below)
     terminalcpCommand: ''          # optional; defaults to running the bundled terminalcp under node
     turnTimeoutMs: 600000          # optional; max wall-clock per turn
     pollIntervalMs: 800            # optional; transcript/screen poll cadence
 ```
 
 Select it per workflow/node with `provider: claude-terminal`, or as the default via `DEFAULT_AI_ASSISTANT=claude-terminal`.
+
+### Isolating Archon's Claude config (`CLAUDE_CONFIG_DIR`)
+
+By default the spawned TUI shares your personal `~/.claude` (config, login, skills, MCP, plugins). Set `claudeConfigDir` to give Archon a **dedicated** Claude environment instead:
+
+```yaml
+assistants:
+  claude-terminal:
+    claudeConfigDir: ~/.archon/claude-home   # absolute path or ~/…
+```
+
+A single directory isolates **everything user-scoped** (verified against Claude Code 2.1.179): settings, `agents/`, `projects/` transcripts, caches — *and* `<dir>/.claude.json`, which holds the **login/auth session and user-scope MCP config**. So it fully hides your real `~/.claude` and `~/.claude.json` from Archon's instances, with no `HOME` relocation or bind mounts.
+
+:::caution[Provision the dir once]
+A fresh config dir is unauthenticated. Because the provider drives the TUI unattended and only dismisses the folder-trust dialog (not login/onboarding), you must **run `CLAUDE_CONFIG_DIR=<dir> claude` once by hand** — log in and finish onboarding — before using it in workflows. Skip this and the first turn fails at boot with `did not become input-ready` (the error names the dir and the exact command to run).
+:::
+
+**Precedence** (highest first): this `claudeConfigDir` option → a `CLAUDE_CONFIG_DIR` in the request env bag → an ambient `CLAUDE_CONFIG_DIR` in Archon's environment → default `~/.claude`. The trusted config option wins over the env bag on purpose — that bag includes a cloned repo's untrusted `env:` block, so an explicit isolation setting can't be silently reversed by forwarded env.
+
+`CLAUDE_CONFIG_DIR` isolates the **config dir + auth** only — treat it as defense-in-depth, not a security boundary. It doesn't sandbox inherited `ANTHROPIC_*`/`CLAUDE_CODE_*` env or enterprise managed settings, and a repo's `assistants:` block can still override it (as it can `claudeBinaryPath`). For a true *execution* boundary rely on worktree isolation — and note worktrees share `HOME`, so an untrusted run can reach `~/.claude*` via the shell anyway.
 
 ### Supported Archon Features
 

@@ -11,7 +11,7 @@
  */
 import { readdir, realpath } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { isValidEnvVarName } from '@archon/paths';
 
 /** Spec for one TUI launch. */
@@ -127,9 +127,37 @@ export function buildLaunchCommand(
   return `cd ${shellQuote(cwd)} && ${envPrefix} ${shellQuote(binary)} ${quotedArgs}`;
 }
 
-/** Root of Claude Code's per-project session transcripts. */
-export function claudeProjectsRoot(): string {
-  return join(homedir(), '.claude', 'projects');
+/** Default Claude Code config dir when `CLAUDE_CONFIG_DIR` is unset. */
+function defaultClaudeConfigDir(): string {
+  return join(homedir(), '.claude');
+}
+
+/**
+ * Resolve an explicit `CLAUDE_CONFIG_DIR` value to an absolute, NFC-normalized
+ * path. Expands a leading `~`/`~/…` and resolves a relative path against the
+ * home dir, so the value we INJECT into the spawned CLI's env and the value we
+ * READ transcripts from are byte-identical. Two reasons this normalization is
+ * load-bearing: (1) the env assignment is single-quoted in the `bash -c`
+ * launch string, so the shell can't expand a `~` for us; (2) Claude Code itself
+ * NFC-normalizes the config dir (`(process.env.CLAUDE_CONFIG_DIR ??
+ * ~/.claude).normalize("NFC")`, verified against the 2.1.179 binary), so an
+ * un-normalized root could fail to match the dir the CLI actually writes to.
+ */
+export function resolveClaudeConfigDir(value: string): string {
+  let p = value.trim();
+  if (p === '~') p = homedir();
+  else if (p.startsWith('~/')) p = join(homedir(), p.slice(2));
+  if (!isAbsolute(p)) p = join(homedir(), p);
+  return p.normalize('NFC');
+}
+
+/**
+ * Root of Claude Code's per-project session transcripts. With an explicit
+ * `configDir` (a resolved `CLAUDE_CONFIG_DIR`), transcripts live at
+ * `<configDir>/projects`; otherwise the default `~/.claude/projects`.
+ */
+export function claudeProjectsRoot(configDir?: string): string {
+  return join(configDir ?? defaultClaudeConfigDir(), 'projects');
 }
 
 /**

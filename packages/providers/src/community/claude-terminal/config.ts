@@ -21,6 +21,10 @@ export function parseClaudeTerminalConfig(
     result.claudeBinaryPath = raw.claudeBinaryPath;
   }
 
+  if (typeof raw.claudeConfigDir === 'string' && raw.claudeConfigDir.trim() !== '') {
+    result.claudeConfigDir = raw.claudeConfigDir;
+  }
+
   if (typeof raw.terminalcpCommand === 'string') {
     result.terminalcpCommand = raw.terminalcpCommand;
   }
