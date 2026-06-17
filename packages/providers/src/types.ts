@@ -171,6 +171,20 @@ export interface ClaudeTerminalProviderDefaults {
    */
   claudeBinaryPath?: string;
   /**
+   * Isolated Claude Code config directory (`CLAUDE_CONFIG_DIR`). When set, the
+   * spawned TUI reads/writes ALL user-scope config from this dir instead of the
+   * default `~/.claude` — settings, projects/transcripts, agents, AND the
+   * `.claude.json` auth/login + user MCP file (verified against Claude Code
+   * 2.1.179). This fully hides the operator's personal `~/.claude` /
+   * `~/.claude.json` from Archon's instances. The dir must be provisioned ONCE
+   * interactively (`CLAUDE_CONFIG_DIR=<dir> claude` → log in + finish
+   * onboarding) before unattended use, or the first turn hangs at boot. A
+   * leading `~` is expanded; relative paths resolve against the home dir.
+   * Precedence: codebase `CLAUDE_CONFIG_DIR` env var > this option > ambient
+   * `CLAUDE_CONFIG_DIR` > default `~/.claude`.
+   */
+  claudeConfigDir?: string;
+  /**
    * How to invoke terminalcp (space-separated). Defaults to running the
    * workspace-installed terminalcp by its resolved entry with the current JS
    * runtime (works from any cwd). Override to use a different launcher.

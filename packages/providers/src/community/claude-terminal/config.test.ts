@@ -8,6 +8,7 @@ describe('parseClaudeTerminalConfig', () => {
       parseClaudeTerminalConfig({
         model: 'sonnet',
         claudeBinaryPath: '/usr/bin/claude',
+        claudeConfigDir: '~/.archon/claude-home',
         terminalcpCommand: 'npx terminalcp',
         turnTimeoutMs: 5000,
         pollIntervalMs: 200,
@@ -17,12 +18,18 @@ describe('parseClaudeTerminalConfig', () => {
     ).toEqual({
       model: 'sonnet',
       claudeBinaryPath: '/usr/bin/claude',
+      claudeConfigDir: '~/.archon/claude-home',
       terminalcpCommand: 'npx terminalcp',
       turnTimeoutMs: 5000,
       pollIntervalMs: 200,
       stallTimeoutMs: 240_000,
       maxStallRecoveries: 2,
     });
+  });
+
+  it('drops a blank or non-string claudeConfigDir', () => {
+    expect(parseClaudeTerminalConfig({ claudeConfigDir: '   ' })).toEqual({});
+    expect(parseClaudeTerminalConfig({ claudeConfigDir: 123 })).toEqual({});
   });
 
   it('keeps maxStallRecoveries: 0 (explicit watchdog disable)', () => {

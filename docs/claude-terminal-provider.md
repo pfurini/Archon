@@ -76,11 +76,35 @@ All keys live under `assistants.claude-terminal`. All are optional and parsed de
 |---|---|---|---|
 | `model` | string | (CLI default) | Passed verbatim to `claude --model`. Archon does **not** validate model names — the CLI/API is the source of truth. |
 | `claudeBinaryPath` | string | resolver → `Bun.which('claude')` → `claude` | Absolute path to the Claude Code executable. Falls back to `CLAUDE_BIN_PATH` / `PATH`. |
+| `claudeConfigDir` | string | `~/.claude` | Isolated `CLAUDE_CONFIG_DIR` for the spawned TUI — see [§4.1](#41-config-isolation-claude_config_dir). A leading `~` is expanded; relative paths resolve against `$HOME`. |
 | `terminalcpCommand` | string | workspace terminalcp under `node` | How to invoke terminalcp (space-separated). Override to use a different launcher. Falls back to `npx -y @mariozechner/terminalcp` if not installed. |
 | `turnTimeoutMs` | number > 0 | `600000` (10 min) | Hard wall-clock per turn. A **backstop**, not the normal completion path (see §7). |
 | `pollIntervalMs` | number > 0 | `800` | How often the transcript + screen are polled while awaiting a turn. |
 
 Other per-turn inputs come from the workflow node / request, not config: `model`, `systemPrompt` (→ `--append-system-prompt`), `allowed_tools`/`denied_tools`, `mcp` (→ `--mcp-config`), `output_format`, codebase env vars, and `abortSignal`.
+
+### 4.1 Config isolation (`CLAUDE_CONFIG_DIR`)
+
+By default the spawned TUI uses your personal `~/.claude` — the same config, login, skills, MCP servers, and plugins you use by hand. To give Archon its **own** Claude environment, set `claudeConfigDir`:
+
+```yaml
+assistants:
+  claude-terminal:
+    claudeConfigDir: ~/.archon/claude-home   # any absolute path or ~/…
+```
+
+This exports `CLAUDE_CONFIG_DIR=<dir>` into the spawned TUI **and** points the provider's transcript reader at `<dir>/projects`, so both sides stay in sync. One directory isolates **everything user-scoped** (verified against Claude Code 2.1.179):
+
+- `<dir>/settings.json`, `<dir>/agents/`, `<dir>/CLAUDE.md`, `<dir>/projects/` (transcripts), caches — the whole `.claude` dir contents.
+- `<dir>/.claude.json` — the **auth/login** session **and** user-scope MCP server config (Claude Code resolves this file at `$CLAUDE_CONFIG_DIR/.claude.json` when the var is set).
+
+So a single `claudeConfigDir` **fully hides** your real `~/.claude` *and* `~/.claude.json` from Archon's instances — no `HOME` relocation, no bind mounts.
+
+> **⚠️ Provision the dir once before unattended use.** A fresh config dir is unauthenticated, so the first interactive launch shows the login + onboarding screens. This provider drives the TUI unattended and only dismisses the *folder-trust* dialog — it deliberately does **not** script login/onboarding. **Run `CLAUDE_CONFIG_DIR=<dir> claude` once by hand** (log in, finish onboarding); after that only the per-project trust dialog appears, which the provider handles. If you skip this, the first turn fails at boot with `did not become input-ready` — and the error names the dir and the exact provisioning command.
+
+**Precedence** (highest first): a codebase `CLAUDE_CONFIG_DIR` env var → this `claudeConfigDir` option → an ambient `CLAUDE_CONFIG_DIR` in Archon's own environment → the default `~/.claude`. When none is set, behavior is byte-identical to before (no env injected, default transcript root).
+
+**Scope.** `CLAUDE_CONFIG_DIR` isolates the **user config dir + auth**. It does **not** sandbox inherited process env (`ANTHROPIC_*`, `CLAUDE_CODE_*`) or enterprise/system *managed* settings — those are separate isolation axes. For a real *execution* boundary, still rely on Archon's worktree isolation (§6.4).
 
 ---
 

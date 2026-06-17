@@ -47,8 +47,10 @@ import { parseClaudeTerminalConfig } from './config';
 import {
   buildClaudeArgs,
   buildLaunchCommand,
+  claudeProjectsRoot,
   findTranscriptByUuid,
   isTrustPrompt,
+  resolveClaudeConfigDir,
   type ClaudeLaunchSpec,
 } from './launch';
 import { TerminalcpClient, bracketedPaste, type TerminalDriver } from './terminalcp';
@@ -119,7 +121,9 @@ function resolveMcpPath(mcp: string, cwd: string): string {
 export interface ClaudeTerminalProviderDeps {
   createClient?: (command?: string) => TerminalDriver;
   resolveBinary?: (configured?: string) => Promise<string | undefined>;
-  findTranscript?: (sessionId: string) => Promise<string | null>;
+  /** Resolve a session transcript by id. `root` is the projects dir to scan
+   *  (derived from the effective `CLAUDE_CONFIG_DIR`); defaults to `~/.claude`. */
+  findTranscript?: (sessionId: string, root?: string) => Promise<string | null>;
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
 }
@@ -127,7 +131,7 @@ export interface ClaudeTerminalProviderDeps {
 export class ClaudeTerminalProvider implements IAgentProvider {
   private readonly createClient: (command?: string) => TerminalDriver;
   private readonly resolveBinary: (configured?: string) => Promise<string | undefined>;
-  private readonly findTranscript: (sessionId: string) => Promise<string | null>;
+  private readonly findTranscript: (sessionId: string, root?: string) => Promise<string | null>;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly now: () => number;
 
@@ -177,6 +181,28 @@ export class ClaudeTerminalProvider implements IAgentProvider {
       (await this.resolveBinary(config.claudeBinaryPath)) ?? Bun.which('claude') ?? 'claude';
     const client = this.createClient(config.terminalcpCommand);
 
+    // Resolve the effective Claude config dir (CLAUDE_CONFIG_DIR). When set, the
+    // spawned TUI reads/writes ALL user-scope config (settings, transcripts,
+    // .claude.json auth) from this dir — fully isolating Archon from the
+    // operator's personal ~/.claude. Both sides must agree on the SAME resolved
+    // absolute path: we inject it into the child env (write side) AND scan it
+    // for the transcript (read side). Precedence: codebase env override > config
+    // option > ambient CLAUDE_CONFIG_DIR > default (~/.claude, claudeConfigDir
+    // left undefined so behavior stays byte-identical for non-isolated users).
+    const explicitConfigDir =
+      requestOptions?.env?.CLAUDE_CONFIG_DIR ??
+      config.claudeConfigDir ??
+      process.env.CLAUDE_CONFIG_DIR;
+    const claudeConfigDir = explicitConfigDir
+      ? resolveClaudeConfigDir(explicitConfigDir)
+      : undefined;
+    const transcriptRoot = claudeProjectsRoot(claudeConfigDir);
+    // Re-inject the resolved (expanded, absolute, NFC) value so the child uses
+    // exactly the path we scan — overriding any raw/`~`-laden codebase override.
+    const launchEnv = claudeConfigDir
+      ? { ...requestOptions?.env, CLAUDE_CONFIG_DIR: claudeConfigDir }
+      : requestOptions?.env;
+
     const isResume = Boolean(resumeSessionId);
     const sessionId = resumeSessionId ?? randomUUID();
     const sessionName = `archon-ct-${sessionId.slice(0, 8)}`;
@@ -200,14 +226,14 @@ export class ClaudeTerminalProvider implements IAgentProvider {
       disallowedTools: nodeConfig?.denied_tools,
       mcpConfigPaths: nodeConfig?.mcp ? [resolveMcpPath(nodeConfig.mcp, cwd)] : undefined,
     };
-    const command = buildLaunchCommand(binary, buildClaudeArgs(spec), cwd, requestOptions?.env);
+    const command = buildLaunchCommand(binary, buildClaudeArgs(spec), cwd, launchEnv);
     // Same launch but resuming this session — used by the stall watchdog to
     // replace a wedged TUI process without losing the conversation.
     const resumeCommand = buildLaunchCommand(
       binary,
       buildClaudeArgs({ ...spec, resume: true }),
       cwd,
-      requestOptions?.env
+      launchEnv
     );
 
     const turnTimeoutMs = config.turnTimeoutMs ?? DEFAULT_TURN_TIMEOUT_MS;
@@ -222,7 +248,7 @@ export class ClaudeTerminalProvider implements IAgentProvider {
 
     // Resume: the transcript already exists — start reading AFTER its current
     // end so prior turns are skipped (`--resume` appends to the same file).
-    let transcriptPath = await this.findTranscript(sessionId);
+    let transcriptPath = await this.findTranscript(sessionId, transcriptRoot);
     let startOffset = 0;
     if (transcriptPath) {
       try {
@@ -238,7 +264,7 @@ export class ClaudeTerminalProvider implements IAgentProvider {
     );
     await client.start(sessionName, command);
     try {
-      await this.ensureInputReady(client, sessionName, throwIfAborted);
+      await this.ensureInputReady(client, sessionName, throwIfAborted, claudeConfigDir);
 
       // Clear any pre-filled input (operator plugins can inject box text) before
       // pasting our prompt, then bracketed-paste + Enter (raw \n does not submit;
@@ -249,7 +275,12 @@ export class ClaudeTerminalProvider implements IAgentProvider {
 
       const deadline = this.now() + turnTimeoutMs;
       if (!transcriptPath) {
-        transcriptPath = await this.waitForTranscript(sessionId, deadline, throwIfAborted);
+        transcriptPath = await this.waitForTranscript(
+          sessionId,
+          transcriptRoot,
+          deadline,
+          throwIfAborted
+        );
       }
 
       const reader = new TranscriptReader(transcriptPath, startOffset);
@@ -370,11 +401,16 @@ export class ClaudeTerminalProvider implements IAgentProvider {
   }
 
   /** Wait for the TUI to boot: dismiss the folder-trust dialog and block until
-   *  the input box is ready. Throws if it never becomes ready. */
+   *  the input box is ready. Throws if it never becomes ready. When an isolated
+   *  `isolatedConfigDir` is in effect, a boot timeout most likely means that dir
+   *  is unprovisioned (the login/onboarding screens block input-readiness and
+   *  this provider deliberately does not script them) — so the error points the
+   *  operator at the one-time `CLAUDE_CONFIG_DIR=<dir> claude` provisioning. */
   private async ensureInputReady(
     client: TerminalDriver,
     sessionName: string,
-    throwIfAborted: () => void
+    throwIfAborted: () => void,
+    isolatedConfigDir?: string
   ): Promise<void> {
     const deadline = this.now() + BOOT_TIMEOUT_MS;
     let trustAccepts = 0;
@@ -393,22 +429,29 @@ export class ClaudeTerminalProvider implements IAgentProvider {
       if (detectScreenActivity(screen).inputReady) return;
       await this.sleep(INPUT_READY_POLL_MS);
     }
+    const provisioningHint = isolatedConfigDir
+      ? ` The isolated CLAUDE_CONFIG_DIR (${isolatedConfigDir}) may be unprovisioned — ` +
+        `run \`CLAUDE_CONFIG_DIR=${isolatedConfigDir} claude\` once to log in and finish onboarding.`
+      : '';
     throw new Error(
-      'claude-terminal: TUI did not become input-ready within boot timeout. ' +
-        `Last screen:\n${describeScreen(lastScreen)}`
+      'claude-terminal: TUI did not become input-ready within boot timeout.' +
+        provisioningHint +
+        `\nLast screen:\n${describeScreen(lastScreen)}`
     );
   }
 
   /** Poll for the session transcript file to appear (new session, after the
-   *  first prompt). Throws on timeout. */
+   *  first prompt) under `root` (the effective CLAUDE_CONFIG_DIR projects dir).
+   *  Throws on timeout. */
   private async waitForTranscript(
     sessionId: string,
+    root: string,
     deadline: number,
     throwIfAborted: () => void
   ): Promise<string> {
     while (this.now() < deadline) {
       throwIfAborted();
-      const path = await this.findTranscript(sessionId);
+      const path = await this.findTranscript(sessionId, root);
       if (path) return path;
       await this.sleep(TRANSCRIPT_WAIT_POLL_MS);
     }

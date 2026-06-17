@@ -1,15 +1,17 @@
 import { describe, it, expect, afterEach } from 'bun:test';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
   buildClaudeArgs,
   buildLaunchCommand,
+  claudeProjectsRoot,
   shellQuote,
   expectedTranscriptDir,
   findTranscriptByUuid,
   isTrustPrompt,
+  resolveClaudeConfigDir,
 } from './launch';
 
 describe('buildClaudeArgs', () => {
@@ -159,6 +161,35 @@ describe('isTrustPrompt', () => {
   });
   it('is false for a normal idle screen', () => {
     expect(isTrustPrompt('❯ \nModel: Sonnet 4.6')).toBe(false);
+  });
+});
+
+describe('claudeProjectsRoot', () => {
+  it('defaults to ~/.claude/projects when no config dir', () => {
+    expect(claudeProjectsRoot()).toBe(join(homedir(), '.claude', 'projects'));
+  });
+  it('roots at <configDir>/projects when an isolated dir is given', () => {
+    expect(claudeProjectsRoot('/srv/archon-claude')).toBe(join('/srv/archon-claude', 'projects'));
+  });
+});
+
+describe('resolveClaudeConfigDir', () => {
+  it('passes an absolute path through (NFC-normalized)', () => {
+    expect(resolveClaudeConfigDir('/opt/archon/claude')).toBe('/opt/archon/claude');
+  });
+  it('expands a bare ~ to the home dir', () => {
+    expect(resolveClaudeConfigDir('~')).toBe(homedir());
+  });
+  it('expands a leading ~/ to a home-relative path', () => {
+    expect(resolveClaudeConfigDir('~/.archon/claude-home')).toBe(
+      join(homedir(), '.archon', 'claude-home')
+    );
+  });
+  it('resolves a relative path against the home dir (so child + read side agree)', () => {
+    expect(resolveClaudeConfigDir('archon-claude')).toBe(join(homedir(), 'archon-claude'));
+  });
+  it('trims surrounding whitespace before resolving', () => {
+    expect(resolveClaudeConfigDir('  /opt/x  ')).toBe('/opt/x');
   });
 });
 
