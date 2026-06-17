@@ -99,10 +99,11 @@ export function curatedOptionsForAgent(agentId: string): readonly ModelOption[] 
 }
 
 // ---------------------------------------------------------------------------
-// Effort. Tier/alias `effort` only ROUTES on Claude (node `effort`) and Codex
-// (`modelReasoningEffort`) — `routePresetEffort` in
-// packages/workflows/src/model-validation.ts returns null for everything else,
-// and the PATCH routes validate via `isEffortValidForProvider`. The web
+// Effort. Tier/alias `effort` ROUTES across every `effortControl` agent (#6):
+// Codex consumes its own `modelReasoningEffort` enum; every other effort-capable
+// agent consumes the portable canonical node `effort` (low|medium|high|max).
+// `routePresetEffort` in packages/workflows/src/model-validation.ts performs the
+// routing and the PATCH routes validate via `isEffortValidForProvider`. The web
 // package cannot import @archon/workflows, so the vocabularies are mirrored
 // here (same convention as REASONING_EFFORTS in the Defaults panel).
 // ---------------------------------------------------------------------------
@@ -118,13 +119,28 @@ export type CodexEffort = (typeof CODEX_EFFORT_OPTIONS)[number];
 export type EffortOption = ClaudeEffort | CodexEffort;
 
 /**
+ * Agents whose tier/alias `effort` routes to the portable canonical node
+ * `effort` (`low|medium|high|max`) — every `effortControl` agent except Codex,
+ * which has its own enum (handled separately). Agents absent here — OpenCode (no
+ * effort concept) and unknown community agents — hide the field rather than
+ * offer a no-op input. Mirrors the non-Codex branch of `routePresetEffort` (#6).
+ */
+const PORTABLE_EFFORT_AGENTS: ReadonlySet<string> = new Set([
+  'claude',
+  'claude-terminal',
+  'pi',
+  'copilot',
+  'cursor',
+]);
+
+/**
  * The effort vocabulary an agent's tier/alias `effort` accepts, or null when
- * effort doesn't route there (Pi/OpenCode/Copilot presets drop it) — null
- * hides the field entirely instead of offering a no-op input.
+ * effort has no effect there (OpenCode / unknown agents) — null hides the field
+ * entirely instead of offering a no-op input.
  */
 export function effortOptionsForAgent(agentId: string): readonly EffortOption[] | null {
-  if (agentId === 'claude') return CLAUDE_EFFORT_OPTIONS;
   if (agentId === 'codex') return CODEX_EFFORT_OPTIONS;
+  if (PORTABLE_EFFORT_AGENTS.has(agentId)) return CLAUDE_EFFORT_OPTIONS;
   return null;
 }
 

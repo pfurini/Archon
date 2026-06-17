@@ -12,6 +12,8 @@
  * per call.
  */
 
+import { getProviderCapabilities } from '@archon/providers';
+
 import tierDefaults from './defaults/tier-defaults.json';
 import type { ThinkingConfig } from './schemas/dag-node';
 
@@ -242,34 +244,46 @@ export type EffortRouting =
   | { field: 'modelReasoningEffort'; value: string };
 
 /**
- * Route a preset's `effort` to the field the resolved provider understands —
- * Claude's generic node `effort` or Codex's `modelReasoningEffort`. Returns
- * `null` when the value isn't valid for that provider (e.g. a cross-provider
- * mismatch like `effort: 'max'` on Codex); callers MUST surface that rather
- * than silently dropping it. Single source of truth for both the DAG executor
- * and the chat orchestrator.
+ * Route a preset's `effort` to the field the resolved provider understands.
+ * Codex consumes its own `modelReasoningEffort` enum; every other provider with
+ * the `effortControl` capability consumes the portable canonical node `effort`
+ * (`low|medium|high|max`), translated to its native vocabulary via `EFFORT_MAPS`
+ * / `mapEffort()` in `@archon/providers`. Returns `null` when the value isn't
+ * valid for that provider (a cross-provider mismatch like `effort: 'xhigh'` on a
+ * non-Codex provider) OR when the provider has no effort concept at all
+ * (OpenCode — `effortControl: false`); callers MUST surface the null (warn)
+ * rather than silently landing an ignored value. Single source of truth for both
+ * the DAG executor and the chat orchestrator.
  */
 export function routePresetEffort(provider: string, effort: string): EffortRouting | null {
-  if (provider === 'claude' && CLAUDE_EFFORTS.has(effort)) {
-    return { field: 'effort', value: effort };
+  if (provider === 'codex') {
+    return CODEX_REASONING_EFFORTS.has(effort)
+      ? { field: 'modelReasoningEffort', value: effort }
+      : null;
   }
-  if (provider === 'codex' && CODEX_REASONING_EFFORTS.has(effort)) {
-    return { field: 'modelReasoningEffort', value: effort };
-  }
-  return null;
+  // A provider without effortControl (OpenCode) consumes no effort field —
+  // returning null lets the consumer emit the `preset_effort_unsupported`
+  // warning instead of landing a value the provider silently ignores.
+  if (!getProviderCapabilities(provider).effortControl) return null;
+  return CLAUDE_EFFORTS.has(effort) ? { field: 'effort', value: effort } : null;
 }
 
 /**
- * The effort vocabulary for a provider, or `null` if the provider has no known
- * effort concept (Pi/OpenRouter/Copilot/OpenCode — effort doesn't route there).
- * Lets the tier-config write path (route + CLI) validate `effort` UP FRONT
- * instead of letting `routePresetEffort` silently drop an unknown value at run
- * time (so `--effort ultra` errors instead of succeeding with no effect).
+ * The effort vocabulary `routePresetEffort` will accept for a provider — Codex's
+ * `modelReasoningEffort` enum, or the portable canonical set (`low|medium|high|max`)
+ * for every other `effortControl` provider. Mirrors `routePresetEffort` exactly so
+ * the tier-config write path (route + CLI) can validate `effort` UP FRONT instead
+ * of letting `routePresetEffort` silently drop an out-of-vocab value at run time
+ * (so `--effort xhigh` on a non-Codex provider errors instead of succeeding with
+ * no effect). Returns an EMPTY array (not `null`) for a provider with no effort
+ * concept (OpenCode) so the invariant `isEffortValidForProvider(p,e) ===
+ * (routePresetEffort(p,e) !== null)` holds and `--effort` is rejected up front
+ * there; `null` is reserved for genuinely unknown providers.
  */
 export function validEffortsForProvider(provider: string): readonly string[] | null {
-  if (provider === 'claude') return [...CLAUDE_EFFORTS];
   if (provider === 'codex') return [...CODEX_REASONING_EFFORTS];
-  return null;
+  if (!getProviderCapabilities(provider).effortControl) return [];
+  return [...CLAUDE_EFFORTS];
 }
 
 /**

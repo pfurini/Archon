@@ -346,9 +346,11 @@ function validateEntryInputs(provider: string, effort: string | undefined): bool
     return false;
   }
   if (effort !== undefined && !isEffortValidForProvider(provider, effort)) {
+    const valid = validEffortsForProvider(provider);
+    const validMsg =
+      valid && valid.length > 0 ? valid.join(', ') : '(this provider has no effort setting)';
     console.error(
-      `Invalid effort '${effort}' for provider '${provider}'. ` +
-        `Valid: ${validEffortsForProvider(provider)?.join(', ') ?? '(this provider has no effort setting)'}.`
+      `Invalid effort '${effort}' for provider '${provider}'. ` + `Valid: ${validMsg}.`
     );
     return false;
   }
