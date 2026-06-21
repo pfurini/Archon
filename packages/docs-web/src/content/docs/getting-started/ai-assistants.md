@@ -169,6 +169,13 @@ Use the **`env:` form** (not the `claudeConfigDir` option) when you want one dir
 
 This is **config isolation, not a sandbox**: worktrees share `HOME`, so a run can still reach `~/.claude*` via the shell. For a real execution boundary, rely on worktree isolation.
 
+**Also shadow the project `.claude/`?** `CLAUDE_CONFIG_DIR` only swaps the *user* scope — Archon runs still load the project-level `<cwd>/.claude/` (it's discovered by cwd, independent of the config dir). To make Archon load **only** the isolated dir and ignore the project's `.claude/`, restrict the setting sources to `user`:
+
+- **`claude` (SDK):** `assistants.claude.settingSources: [user]`
+- **`claude-terminal`:** `assistants.claude-terminal.settingSources: [user]` (emits `claude --setting-sources user`)
+
+Anything Archon then needs — agents, skills, MCP, `CLAUDE.md` — must live in the isolated config dir, since the project copies are no longer visible to Archon runs.
+
 ### Set as Default (Optional)
 
 If you want Claude to be the default AI assistant for new conversations without codebase context, set this environment variable:
@@ -837,6 +844,8 @@ assistants:
     model: sonnet                  # passed to `claude --model`
     claudeBinaryPath: /abs/claude  # optional; otherwise resolved from PATH
     claudeConfigDir: ~/.archon/claude-home  # optional; isolated CLAUDE_CONFIG_DIR (see below)
+    settingSources: [user]         # optional; → `claude --setting-sources user`
+                                   # (load only the config-dir scope; shadow <cwd>/.claude)
     terminalcpCommand: ''          # optional; defaults to running the bundled terminalcp under node
     turnTimeoutMs: 600000          # optional; max wall-clock per turn
     pollIntervalMs: 800            # optional; transcript/screen poll cadence
@@ -876,6 +885,7 @@ A fresh config dir is unauthenticated. Because the provider drives the TUI unatt
 | Tool restrictions | ✅ | `allowed_tools` / `denied_tools` → `--allowed-tools` / `--disallowed-tools` (verified enforced by the interactive TUI even with `--dangerously-skip-permissions`) |
 | Structured output | ✅ | best-effort: schema appended to the prompt, JSON extracted from the final transcript message; unparseable output degrades to the dag-executor's missing-output warning |
 | System prompt override | ✅ | `systemPrompt:` → `--append-system-prompt` |
+| Setting sources | ✅ | `settingSources: [user\|project\|local]` → `--setting-sources`; use `[user]` to load only the `CLAUDE_CONFIG_DIR` scope and shadow `<cwd>/.claude/` |
 | Codebase env vars (`envInjection`) | ✅ | injected into the spawned TUI's environment |
 | Cost limits (`maxBudgetUsd`) | ❌ | no budget cap in the interactive TUI |
 | Effort control | ✅ | node `effort:` (`low`/`medium`/`high`/`max`) → the interactive `--effort` launch flag |

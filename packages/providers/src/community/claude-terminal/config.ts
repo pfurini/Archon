@@ -17,6 +17,15 @@ export function parseClaudeTerminalConfig(
     result.model = raw.model;
   }
 
+  if (Array.isArray(raw.settingSources)) {
+    const valid = raw.settingSources.filter(
+      (s): s is 'user' | 'project' | 'local' => s === 'user' || s === 'project' || s === 'local'
+    );
+    if (valid.length > 0) {
+      result.settingSources = valid;
+    }
+  }
+
   if (typeof raw.claudeBinaryPath === 'string') {
     result.claudeBinaryPath = raw.claudeBinaryPath;
   }

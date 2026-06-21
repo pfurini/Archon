@@ -272,6 +272,29 @@ describe('ClaudeTerminalProvider', () => {
     expect(startCmd).not.toContain('--effort');
   });
 
+  it('passes assistant settingSources through to the launch command as --setting-sources', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'archon-ct-'));
+    const tpath = join(dir, 'sess.jsonl');
+    const driver = new FakeDriver([IDLE_SCREEN], () => writeFileSync(tpath, TURN_LINES));
+    const provider = new ClaudeTerminalProvider({
+      createClient: () => driver,
+      resolveBinary: async () => '/fake/claude',
+      findTranscript: async () => (existsSync(tpath) ? tpath : null),
+      sleep: async () => {},
+    });
+
+    await drain(
+      provider.sendQuery('do it', '/work', undefined, {
+        assistantConfig: { settingSources: ['user'] },
+      })
+    );
+
+    const startCmd = driver.calls.find(c => c.m === 'start')?.segments?.[0] ?? '';
+    // Shadows the project <cwd>/.claude — loads only the CLAUDE_CONFIG_DIR scope.
+    expect(startCmd).toContain('--setting-sources');
+    expect(startCmd).toContain("'user'");
+  });
+
   describe('CLAUDE_CONFIG_DIR isolation', () => {
     // The resolver reads ambient process.env.CLAUDE_CONFIG_DIR as a fallback
     // source; pin it OFF so these assertions don't depend on the dev/CI env

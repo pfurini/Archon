@@ -77,6 +77,7 @@ All keys live under `assistants.claude-terminal`. All are optional and parsed de
 | `model` | string | (CLI default) | Passed verbatim to `claude --model`. Archon does **not** validate model names — the CLI/API is the source of truth. |
 | `claudeBinaryPath` | string | resolver → `Bun.which('claude')` → `claude` | Absolute path to the Claude Code executable. Falls back to `CLAUDE_BIN_PATH` / `PATH`. |
 | `claudeConfigDir` | string | `~/.claude` | Isolated `CLAUDE_CONFIG_DIR` for the spawned TUI — see [§4.1](#41-config-isolation-claude_config_dir). A leading `~` is expanded; relative paths resolve against `$HOME`. |
+| `settingSources` | `('user'\|'project'\|'local')[]` | (CLI default: all) | Which setting layers the TUI loads → `--setting-sources <csv>`. Set `[user]` to load ONLY the `CLAUDE_CONFIG_DIR` scope and shadow the project's `<cwd>/.claude/` — see [§4.1](#41-config-isolation-claude_config_dir). |
 | `terminalcpCommand` | string | workspace terminalcp under `node` | How to invoke terminalcp (space-separated). Override to use a different launcher. Falls back to `npx -y @mariozechner/terminalcp` if not installed. |
 | `turnTimeoutMs` | number > 0 | `600000` (10 min) | Hard wall-clock per turn. A **backstop**, not the normal completion path (see §7). |
 | `pollIntervalMs` | number > 0 | `800` | How often the transcript + screen are polled while awaiting a turn. |
@@ -105,6 +106,17 @@ So a single `claudeConfigDir` **fully hides** your real `~/.claude` *and* `~/.cl
 **Precedence** (highest first): this `claudeConfigDir` config option → a `CLAUDE_CONFIG_DIR` in the request env bag → an ambient `CLAUDE_CONFIG_DIR` in Archon's own environment → the default `~/.claude`. The trusted config option deliberately wins over the env bag: that bag is a flat merge that includes a **cloned repo's untrusted `env:` block** (`.archon/config.yaml` is untrusted input — Archon clones and runs arbitrary repos), so an explicit operator isolation setting must not be silently reversible by forwarded env. When none is set, behavior is byte-identical to before (no env injected, default transcript root).
 
 **Scope (this is config isolation, not a sandbox).** `CLAUDE_CONFIG_DIR` isolates the **user config dir + auth**. It does **not** sandbox inherited process env (`ANTHROPIC_*`, `CLAUDE_CODE_*`) or enterprise/system *managed* settings, and — like `claudeBinaryPath`/`terminalcpCommand` — a repo's own `.archon/config.yaml` `assistants:` block can still override the value (repo assistant config takes precedence over global). Treat `claudeConfigDir` as defense-in-depth for keeping Archon off your personal config, **not** as a security boundary against untrusted repos. For a real *execution* boundary, rely on Archon's worktree isolation (§6.4) — and note that worktrees share `HOME`, so an untrusted run can already reach `~/.claude*` via the shell regardless of this setting.
+
+**Shadowing the project `<cwd>/.claude/` too.** `CLAUDE_CONFIG_DIR` swaps only the **user** scope; the project-level `<cwd>/.claude/` is discovered by cwd and still loads. To make a run load **only** the isolated config dir, restrict the setting sources:
+
+```yaml
+assistants:
+  claude-terminal:
+    claudeConfigDir: /abs/repo/.claude-archon
+    settingSources: [user]   # → claude --setting-sources user (drops project + local)
+```
+
+This is the one piece `CLAUDE_CONFIG_DIR` alone can't do. `--setting-sources` governs only which settings/agents/skills/`CLAUDE.md` load — transcript reads, `--allowed-tools`/`--disallowed-tools`, and `--mcp-config` are independent, so the provider keeps working. Anything the run needs must then live in the isolated dir.
 
 ---
 

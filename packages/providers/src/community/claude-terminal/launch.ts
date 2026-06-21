@@ -28,6 +28,10 @@ export interface ClaudeLaunchSpec {
   /** Provider-native effort level (already mapped from the canonical Archon
    *  scale). Emitted as the interactive `--effort <level>` flag. */
   effort?: string;
+  /** Claude Code setting sources to load (subset of `user`/`project`/`local`).
+   *  Emitted as `--setting-sources <comma-separated>`. Omitted when empty, so
+   *  the CLI default (all sources) applies. */
+  settingSources?: string[];
   /** MCP config file paths (from nodeConfig.mcp). */
   mcpConfigPaths?: string[];
   appendSystemPrompt?: string;
@@ -51,6 +55,12 @@ export function buildClaudeArgs(spec: ClaudeLaunchSpec): string[] {
   // `--effort <level>` sets the session's reasoning effort (Claude Code 2.1.166+).
   // Validated by the CLI: an unknown value is warned-and-ignored, never fatal.
   if (spec.effort) args.push('--effort', spec.effort);
+  // `--setting-sources <user,project,local>` restricts which setting layers the
+  // CLI loads. Set to e.g. `user` to load ONLY the CLAUDE_CONFIG_DIR scope and
+  // shadow the project's `<cwd>/.claude/` (Claude Code 2.1.x).
+  if (spec.settingSources?.length) {
+    args.push('--setting-sources', spec.settingSources.join(','));
+  }
 
   if (spec.dangerouslySkipPermissions === false) {
     if (spec.permissionMode) args.push('--permission-mode', spec.permissionMode);

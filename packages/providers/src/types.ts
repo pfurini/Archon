@@ -166,6 +166,17 @@ export interface ClaudeTerminalProviderDefaults {
   /** Model passed to `claude --model` at launch (e.g. 'sonnet', 'opus'). */
   model?: string;
   /**
+   * Which Claude Code setting sources the spawned TUI loads, emitted as
+   * `--setting-sources <comma-separated>`. Subset of `user` (user-scope, i.e.
+   * the `CLAUDE_CONFIG_DIR` dir), `project` (`<cwd>/.claude/`), and `local`
+   * (`.claude/settings.local.json`). When unset, the CLI's default applies
+   * (all sources). Pair with `claudeConfigDir` and set `['user']` to make
+   * Archon runs load ONLY the isolated config dir, shadowing the project's
+   * `<cwd>/.claude/` — the one thing `CLAUDE_CONFIG_DIR` alone can't do (project
+   * scope is discovered by cwd, independent of the config dir).
+   */
+  settingSources?: ('user' | 'project' | 'local')[];
+  /**
    * Absolute path to the Claude Code executable. Falls back to the shared
    * claude binary resolver (`CLAUDE_BIN_PATH` / auto-detect) when unset.
    */

@@ -88,6 +88,26 @@ describe('buildClaudeArgs', () => {
     const args = buildClaudeArgs({ sessionId: 'u1' });
     expect(args).not.toContain('--effort');
   });
+
+  it('emits --setting-sources as a comma-separated list', () => {
+    expect(buildClaudeArgs({ sessionId: 'u1', settingSources: ['user'] })).toEqual([
+      '--session-id',
+      'u1',
+      '--setting-sources',
+      'user',
+      '--dangerously-skip-permissions',
+    ]);
+    const multi = buildClaudeArgs({ sessionId: 'u1', settingSources: ['user', 'project'] });
+    expect(multi).toContain('--setting-sources');
+    expect(multi[multi.indexOf('--setting-sources') + 1]).toBe('user,project');
+  });
+
+  it('omits --setting-sources when unset or empty', () => {
+    expect(buildClaudeArgs({ sessionId: 'u1' })).not.toContain('--setting-sources');
+    expect(buildClaudeArgs({ sessionId: 'u1', settingSources: [] })).not.toContain(
+      '--setting-sources'
+    );
+  });
 });
 
 describe('shellQuote / buildLaunchCommand', () => {

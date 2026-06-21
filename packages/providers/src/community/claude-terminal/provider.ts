@@ -229,6 +229,9 @@ export class ClaudeTerminalProvider implements IAgentProvider {
       // claude-terminal's map is identity, but route through mapEffort so the
       // central table stays the single source of truth.
       effort: mapEffort(nodeConfig?.effort, 'claude-terminal'),
+      // Assistant-config-level (parity with the SDK claude provider's
+      // settingSources); restricts which `.claude` layers the TUI loads.
+      settingSources: config.settingSources,
       appendSystemPrompt: systemPromptAppend(requestOptions?.systemPrompt),
       allowedTools: nodeConfig?.allowed_tools,
       disallowedTools: nodeConfig?.denied_tools,
