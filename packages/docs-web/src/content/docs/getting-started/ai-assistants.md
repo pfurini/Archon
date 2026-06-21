@@ -142,6 +142,33 @@ assistants:
 
 The `settingSources` option controls which `CLAUDE.md`, skill, command, and agent files the Claude Code SDK loads. The default is `['project', 'user']`, which loads both the project-level `<cwd>/.claude/` and your personal `~/.claude/`. Set it to `['project']` if you want to scope a workflow to project-only resources.
 
+### Per-repo isolated config dir (shared by both Claude providers)
+
+To make every Archon run in a repo use a **dedicated** Claude config + login (settings, skills, MCP, plugins, and `.claude.json` auth) instead of your personal `~/.claude`, point `CLAUDE_CONFIG_DIR` at a dedicated directory in that repo's `.archon/config.yaml`:
+
+```yaml
+# <repo>/.archon/config.yaml
+env:
+  CLAUDE_CONFIG_DIR: /Users/me/.archon/claude-homes/myproject
+```
+
+The spawned `claude` binary reads `CLAUDE_CONFIG_DIR` at the process level, so this **one env var works for both Claude providers**:
+
+- **`claude` (SDK)** — Archon merges the repo `env:` into the spawned subprocess environment, so the SDK-launched `claude` picks it up. (The SDK provider has **no** `claudeConfigDir` option — the env var is its only lever.)
+- **`claude-terminal`** — honors `CLAUDE_CONFIG_DIR` from the env bag too (and additionally exposes a dedicated `assistants.claude-terminal.claudeConfigDir` option — see [its section](#isolating-archons-claude-config-claude_config_dir)).
+
+Use the **`env:` form** (not the `claudeConfigDir` option) when you want one dir shared by both providers — the option is claude-terminal-only and the SDK would ignore it, letting the two diverge.
+
+:::caution[Read before using]
+
+- **Absolute path only.** There's no repo-relative substitution, and a relative value desyncs claude-terminal's transcript reader. Use a full path.
+- **Keep it outside the git tree.** `<dir>/.claude.json` holds OAuth credentials — don't commit it. A path under `~/.archon/claude-homes/<project>` is safer than one inside the repo (and Archon runs workflows in worktrees, which wouldn't share an in-repo dir anyway).
+- **Provision once.** A fresh dir is unauthenticated: run `CLAUDE_CONFIG_DIR=<dir> claude` by hand once to log in + finish onboarding. Required for claude-terminal (else the first turn hangs at boot); the SDK provider would otherwise fail with an auth error.
+- **Auth precedence (SDK).** To use the dir's own login, don't also have `CLAUDE_CODE_OAUTH_TOKEN` / `CLAUDE_API_KEY` in that environment — the SDK provider prefers env tokens over the config-dir login.
+:::
+
+This is **config isolation, not a sandbox**: worktrees share `HOME`, so a run can still reach `~/.claude*` via the shell. For a real execution boundary, rely on worktree isolation.
+
 ### Set as Default (Optional)
 
 If you want Claude to be the default AI assistant for new conversations without codebase context, set this environment variable:
@@ -836,6 +863,8 @@ A fresh config dir is unauthenticated. Because the provider drives the TUI unatt
 **Precedence** (highest first): this `claudeConfigDir` option → a `CLAUDE_CONFIG_DIR` in the request env bag → an ambient `CLAUDE_CONFIG_DIR` in Archon's environment → default `~/.claude`. The trusted config option wins over the env bag on purpose — that bag includes a cloned repo's untrusted `env:` block, so an explicit isolation setting can't be silently reversed by forwarded env.
 
 `CLAUDE_CONFIG_DIR` isolates the **config dir + auth** only — treat it as defense-in-depth, not a security boundary. It doesn't sandbox inherited `ANTHROPIC_*`/`CLAUDE_CODE_*` env or enterprise managed settings, and a repo's `assistants:` block can still override it (as it can `claudeBinaryPath`). For a true *execution* boundary rely on worktree isolation — and note worktrees share `HOME`, so an untrusted run can reach `~/.claude*` via the shell anyway.
+
+> **Want one config dir shared by both the SDK `claude` and `claude-terminal` providers?** Set it via the repo's `env:` block instead of this option — see [Per-repo isolated config dir](#per-repo-isolated-config-dir-shared-by-both-claude-providers). The `claudeConfigDir` option here is claude-terminal-only.
 
 ### Supported Archon Features
 
